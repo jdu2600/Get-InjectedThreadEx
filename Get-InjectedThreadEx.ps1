@@ -28,44 +28,45 @@ function Get-InjectedThreadEx
     
     PS > Get-InjectedThreadEx
 
-    ProcessName                  : ThreadStart.exe
-    ProcessId                    : 7784
-    Wow64                        : False
-    Path                         : C:\Users\tester\Desktop\ThreadStart.exe
-    KernelPath                   : C:\Users\tester\Desktop\ThreadStart.exe
-    CommandLine                  : "C:\Users\tester\Desktop\ThreadStart.exe"
-    PathMismatch                 : False
-    ProcessIntegrity             : MEDIUM_MANDATORY_LEVEL
-    ProcessPrivilege             : SeChangeNotifyPrivilege
-    ProcessLogonId               : 999
-    ProcessSecurityIdentifier    : S-1-5-21-386661145-2656271985-3844047388-1001
-    ProcessUserName              : DESKTOP-HMTGQ0R\SYSTEM
-    ProcessLogonSessionStartTime : 3/15/2017 5:45:38 PM
-    ProcessLogonType             : System
-    ProcessAuthenticationPackage : NTLM
-    ThreadId                     : 14512
-    BasePriority                 : 8
-    IsUniqueThreadToken          : False
-    ThreadIntegrity              :
-    ThreadPrivilege              :
-    AdditionalThreadPrivilege    :
-    ThreadLogonId                :
-    ThreadSecurityIdentifier     :
-    ThreadUserName               : \
-    ThreadLogonSessionStartTime  :
-    ThreadLogonType              :
-    ThreadAuthenticationPackage  :
-    AllocatedMemoryProtection    : PAGE_EXECUTE_READWRITE
-    MemoryProtection             : PAGE_EXECUTE_READWRITE
-    MemoryState                  : MEM_COMMIT
-    MemoryType                   : MEM_PRIVATE
-    Win32StartAddress            : 430000
-    Win32StartAddressModule      :
-    Win32StartAddressPrivate     : True
-    Size                         : 4096
-    TailBytes                    : 90909090909090909090909090909090
-    StartBytes                   : 558bec5356578b7d086a008b5f1083671000ff15c4c9595a8bf085f6780f8bcfe82f85f5ff8bf0ff15c8c9595a5653ff
-    Detections                   : {MEM_PRIVATE}
+    ProcessName                   : ThreadStart.exe
+    ProcessId                     : 7784
+    Wow64                         : False
+    Path                          : C:\Users\tester\Desktop\ThreadStart.exe
+    KernelPath                    : C:\Users\tester\Desktop\ThreadStart.exe
+    CommandLine                   : "C:\Users\tester\Desktop\ThreadStart.exe"
+    PathMismatch                  : False
+    ProcessIntegrity              : MEDIUM_MANDATORY_LEVEL
+    ProcessPrivilege              : SeChangeNotifyPrivilege
+    ProcessLogonId                : 999
+    ProcessSecurityIdentifier     : S-1-5-21-386661145-2656271985-3844047388-1001
+    ProcessUserName               : DESKTOP-HMTGQ0R\SYSTEM
+    ProcessLogonSessionStartTime  : 3/15/2017 5:45:38 PM
+    ProcessLogonType              : System
+    ProcessAuthenticationPackage  : NTLM
+    ThreadId                      : 14512
+    BasePriority                  : 8
+    IsUniqueThreadToken           : False
+    ThreadIntegrity               :
+    ThreadPrivilege               :
+    AdditionalThreadPrivilege     :
+    ThreadLogonId                 :
+    ThreadSecurityIdentifier      :
+    ThreadUserName                : \
+    ThreadLogonSessionStartTime   :
+    ThreadLogonType               :
+    ThreadAuthenticationPackage   :
+    AllocatedMemoryProtection     : PAGE_EXECUTE_READWRITE
+    MemoryProtection              : PAGE_EXECUTE_READWRITE
+    MemoryState                   : MEM_COMMIT
+    MemoryType                    : MEM_PRIVATE
+    Win32StartAddress             : 430000
+    Win32StartAddressModule       :
+    Win32StartAddressModuleSigned : False
+    Win32StartAddressPrivate      : True
+    Size                          : 4096
+    TailBytes                     : 90909090909090909090909090909090
+    StartBytes                    : 558bec5356578b7d086a008b5f1083671000ff15c4c9595a8bf085f6780f8bcfe82f85f5ff8bf0ff15c8c9595a5653ff
+    Detections                    : {MEM_PRIVATE}
     
     #>
 
@@ -76,21 +77,22 @@ function Get-InjectedThreadEx
         [Switch]$Aggressive
     )
 
+    $AuthenticodeSignatures = @{}
     $WindowsVersion = [Int]((Get-WmiObject Win32_OperatingSystem).version -split '\.')[0]
-    foreach($proc in (Get-Process))
+    foreach($Process in (Get-Process))
     {
-        if($proc.Id -eq 0 -or $proc.Id -eq 4)
+        if($Process.Id -eq 0 -or $Process.Id -eq 4)
         {
             continue # skip Idle and System
         }
 
-        $hProcess = OpenProcess -ProcessId $proc.Id -DesiredAccess PROCESS_ALL_ACCESS -InheritHandle $false
+        $hProcess = OpenProcess -ProcessId $Process.Id -DesiredAccess PROCESS_ALL_ACCESS -InheritHandle $false
         if($hProcess -eq 0)
         {
             continue # skip process - Access is Denied
         }
 
-        Write-Verbose -Message "Checking $($proc.Name) [$($proc.Id)] for injection"
+        Write-Verbose -Message "Checking $($Process.Name) [$($Process.Id)] for injection"
         $IsWow64Process = IsWow64Process -ProcessHandle $hProcess
 
         $hProcessToken = OpenProcessToken -ProcessHandle $hProcess -DesiredAccess TOKEN_QUERY
@@ -102,7 +104,7 @@ function Get-InjectedThreadEx
             $ProcessIntegrity = GetTokenInformation -TokenHandle $hProcessToken -TokenInformationClass 25
         }
 
-        foreach ($thread in $proc.Threads)
+        foreach ($thread in $Process.Threads)
         {
             $hThread = OpenThread -ThreadId $thread.Id -DesiredAccess THREAD_ALL_ACCESS
             if ($hThread -eq 0)
@@ -135,28 +137,44 @@ function Get-InjectedThreadEx
 
             # Win32StartAddress memory information
             $Win32StartAddress = NtQueryInformationThread_Win32StartAddress -ThreadHandle $hThread
-            $memory_basic_info = VirtualQueryEx -ProcessHandle $hProcess -BaseAddress $Win32StartAddress
-            $AllocatedMemoryProtection = $memory_basic_info.AllocationProtect -as $MemProtection
-            $MemoryProtection = $memory_basic_info.Protect -as $MemProtection
-            $MemoryState = $memory_basic_info.State -as $MemState
-            $MemoryType = $memory_basic_info.Type -as $MemType
-               
+            $MemoryBasicInfo = VirtualQueryEx -ProcessHandle $hProcess -BaseAddress $Win32StartAddress
+            $AllocatedMemoryProtection = $MemoryBasicInfo.AllocationProtect -as $MemProtection
+            $MemoryProtection = $MemoryBasicInfo.Protect -as $MemProtection
+            $MemoryState = $MemoryBasicInfo.State -as $MemState
+            $MemoryType = $MemoryBasicInfo.Type -as $MemType
+
+            # Win32StartAddress module information
+            $Signed = $false
+            $IsMicrosoftModule = $false
+            if($MemoryType -eq $MemType::MEM_IMAGE)
+            {
+                $StartAddressModule = GetMappedFileName -ProcessHandle $hProcess -Address $Win32StartAddress
+                if(-not $AuthenticodeSignatures.ContainsKey($StartAddressModule))
+                {
+                    $AuthenticodeSignatures[$StartAddressModule] = Get-AuthenticodeSignature -FilePath $StartAddressModule
+                }
+                $AuthenticodeSignature = $AuthenticodeSignatures
+                $Signed = $AuthenticodeSignature.Status -eq 'Valid'
+                if($Signed)
+                {
+                    $Signer = $AuthenticodeSignature.SignerCertificate.Subject
+                    $IsMicrosoftModule = $Signer -match 'Microsoft'
+                }
+            }
+
             if ($MemoryState -eq $MemState::MEM_COMMIT)
             {
-                $StartBytesLength = [math]::Min(48, [UInt64]$memory_basic_info.BaseAddress + [UInt64]$memory_basic_info.RegionSize - [Int64]$Win32StartAddress)
-                $buf = ReadProcessMemory -ProcessHandle $hProcess -BaseAddress $Win32StartAddress -Size $StartBytesLength
+                $StartBytesLength = [math]::Min(48, [UInt64]$MemoryBasicInfo.BaseAddress + [UInt64]$MemoryBasicInfo.RegionSize - [Int64]$Win32StartAddress)
+                $Buffer = ReadProcessMemory -ProcessHandle $hProcess -BaseAddress $Win32StartAddress -Size $StartBytesLength
                 $StartBytes = New-Object -TypeName System.Text.StringBuilder($StartBytesLength)
-                ForEach ($byte in $buf) { $StartBytes.AppendFormat("{0:x2}", $byte) | Out-Null }
+                ForEach ($Byte in $Buffer) { $StartBytes.AppendFormat("{0:x2}", $Byte) | Out-Null }
                 $StartBytes = $StartBytes.ToString()
 
-                $TailBytesLength = [math]::Min(16, [Int64]$Win32StartAddress - [UInt64]$memory_basic_info.BaseAddress)
-                $buf = ReadProcessMemory -ProcessHandle $hProcess -BaseAddress ([Int64]$Win32StartAddress - $TailBytesLength) -Size $TailBytesLength
+                $TailBytesLength = [math]::Min(16, [Int64]$Win32StartAddress - [UInt64]$MemoryBasicInfo.BaseAddress)
+                $Buffer = ReadProcessMemory -ProcessHandle $hProcess -BaseAddress ([Int64]$Win32StartAddress - $TailBytesLength) -Size $TailBytesLength
                 $TailBytes = New-Object -TypeName System.Text.StringBuilder($TailBytesLength)
-                ForEach ($byte in $buf) { $TailBytes.AppendFormat("{0:x2}", $byte) | Out-Null }
+                ForEach ($Byte in $Buffer) { $TailBytes.AppendFormat("{0:x2}", $Byte) | Out-Null }
                 $TailBytes = $TailBytes.ToString()
-
-                $StartAddressModule = GetMappedFileName -ProcessHandle $hProcess -Address $Win32StartAddress
-                $WindowsRegex = '^\\Device\\HarddiskVolume\d+\\Windows\\'
 
                 # Suspicious thread heuristics
                 # original
@@ -177,17 +195,18 @@ function Get-InjectedThreadEx
                     $Detections += $MemoryType
                 }
 
-                # Modern CPUs load instructions in 16-byte lines. So, for performance, compilers want to ensure
-                # that the maximum number of useful bytes will be loaded. This is either 16 or the number
-                # of bytes modulo 16 until the end of the first call (or absolute jmp) instruction.
+                # Modern CPUs load instructions in 16-byte lines. So, for performance, compilers may want to
+                # ensure that the maximum number of useful bytes will be loaded. This is either 16 or the
+                # number of bytes modulo 16 until the end of the first call (or absolute jmp) instruction.
+                #
                 # Any start address not aligned as such is a potential MEM_IMAGE trampoline gadget such
                 # as 'jmp rcx'
                 # https://blog.xpnsec.com/undersanding-and-evading-get-injectedthread/
-
-                $EarlyCallRegex = '^(..)*?e8'
+                #
+                # In practice, this has a high FP rate - so only check Microsoft binaries by default.
+                $EarlyCallRegex = '^(..)*?(e8|ff15)'
                 $ImmediateJumpRegex = '^(e9|(48)?ff25)'
-                # Only check Windows components by default - other compilers may behave differently.
-                if ((($StartAddressModule -match $WindowsRegex) -or $Aggressive) -and
+                if (($IsMicrosoftModule -or $Aggressive) -and
                     (([Int64]$Win32StartAddress -band 0xF) -ne 0) -and
                     # If < Windows 10 then also allow 4-byte alignments
                     (($WindowsVersion -ge 10) -or (([Int64]$Win32StartAddress -band 3) -ne 0)))
@@ -212,25 +231,25 @@ function Get-InjectedThreadEx
                 # Any x64 threads not starting with a valid Windows x64 ABI prolog are suspicious
                 # In lieu of a dissassembler in PowerShell we approximate with a regex :-(
                 $x64PrologRegex = '^(' +
-                '(488d0[5d]........)?' + # lea rax,[rip+nnnn]
-                '(eb0.(90){3,14})?' + # hot patch space
-                '(488bc4|4c8bdc)?' + # stack pointer - rax|r11
+                '(488d0[5d]........)?' +             # lea rax,[rip+nnnn]
+                '(eb0.(90){3,14})?' +                # hot patch space
+                '(488bc4|4c8bdc)?' +                 # stack pointer - rax|r11
                 '(4[8-9c]89(....|[3-7][4c]24..))*' + # save registers in shadow space
-                '((5|fff|4(0|1)5)[0-7])*' + # push registers
-                '(488bec|4889e5)?' + # stack pointer - rbp
-                '(488d6c24..)?' + # lea rbp,[rsp+n]
-                '(488dac24........)?' + # lea rbp,[rsp+nnnn]
-                '(488d68..)?' + # lea rbp,[rax+n]
-                '(488da8........)?' + # lea rbp,[rax+nnnn]
-                '(498d6b..)?' + # lea rbp,[r11+n]
-                '(498dab........)?' + # lea rbp,[r11+nnnn]
-                '(488(1|3)ec' + # sub rsp,n
-                '|b8........e8........482be0)' + # mov rax; call; sub rsp, rax
+                '((5|fff|4(0|1)5)[0-7])*' +          # push registers
+                '(488bec|4889e5)?' +                 # stack pointer - rbp
+                '(488d6c24..)?' +                    # lea rbp,[rsp+n]
+                '(488dac24........)?' +              # lea rbp,[rsp+nnnn]
+                '(488d68..)?' +                      # lea rbp,[rax+n]
+                '(488da8........)?' +                # lea rbp,[rax+nnnn]
+                '(498d6b..)?' +                      # lea rbp,[r11+n]
+                '(498dab........)?' +                # lea rbp,[r11+nnnn]
+                '(488(1|3)ec' +                      # sub rsp,n
+                '|b8........e8........482be0)' +     # mov rax; call; sub rsp, rax
                 '|4885c90f8[4-5]........(e9........cc|b8........c3)' + # test rcx,rcx; j[n]e nnnn; [jmp nnnn | mov eax, ret]
-                '|(488d0[5d]........)?(488b..(..)?)*(e9|(48)?ff25)' + # (mov ... ) jmp
+                '|(488d0[5d]........)?(488b..(..)?)*(e9|(48)?ff25)' +  # (mov ... ) jmp
                 '|4d5a90000300000004000000ffff0000b8000000000000004000000000000000' + # PE Header -> CLR Assembly with AddressOfEntryPoint=0
                 ')'
-                # TODO(jdu) - update with more variants? Or is the approach simply too unreliable? Move to -Aggressive perhaps?
+                # TODO(jdu) - update with more variants? Or is the approach simply too unreliable?
                 if ((-not $IsWow64Process) -and
                     ($StartBytes -notmatch $x64PrologRegex))
                 {
@@ -238,9 +257,9 @@ function Get-InjectedThreadEx
                 }
 
                 $x86PrologRegex = '^(' +
-                '(8bff)?55(8bec|89e5)' + # stack pointer
+                '(8bff)?55(8bec|89e5)' +       # stack pointer
                 '|(6a..|(68|b8)........)*e8' + # call
-                '|e9|ff25' + # jmp
+                '|e9|ff25' +                   # jmp
                 '|4d5a90000300000004000000ffff0000b8000000000000004000000000000000' + # CLR Assembly
                 ')'
                 if ($IsWow64Process -and
@@ -260,14 +279,12 @@ function Get-InjectedThreadEx
 
                 # Has our MEM_IMAGE Win32StartAddress been (naively) hooked?
                 # https://blog.redbluepurple.io/offensive-research/bypassing-injection-detection#creating-the-thread
-                # TODO(jdu) if false positives, check against bytes on disk?
+                # Note - checking against bytes on disk after the fact won't help with false positives
+                # as the hook can easily be removed after thread start.
                 # Detection gap - the hook could easily be deeper, potentially even in a subsequent call. :-(
                 # Microsoft-Windows-Threat-Intelligence ETW events should detect this more robustly.
-                #
-                # Only check Windows components by default.
                 $PrivatePage = IsWorkingSetPage -ProcessHandle $hProcess -Address $Win32StartAddress
-                if ((($StartAddressModule -match $WindowsRegex) -or $Aggressive) -and
-                    ($MemoryType -eq $MemType::MEM_IMAGE) -and
+                if (($MemoryType -eq $MemType::MEM_IMAGE) -and
                     $PrivatePage)
                 {
                     $Detections += 'modified'
@@ -339,9 +356,9 @@ function Get-InjectedThreadEx
 
                 if ($Detections.Length -ne 0)
                 {
-                    $WmiProcess = Get-WmiObject Win32_Process -Filter "ProcessId = '$($proc.Id)'"
+                    $WmiProcess = Get-WmiObject Win32_Process -Filter "ProcessId = '$($Process.Id)'"
                     $KernelPath = QueryFullProcessImageName -ProcessHandle $hProcess
-                    $PathMismatch = $proc.Path.ToLower() -ne $KernelPath.ToLower()
+                    $PathMismatch = $Process.Path.ToLower() -ne $KernelPath.ToLower()
 
                     $ThreadDetail = New-Object PSObject
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessName -Value $WmiProcess.Name
@@ -378,8 +395,9 @@ function Get-InjectedThreadEx
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name MemoryType -Value $MemoryType
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddress -Value $Win32StartAddress.ToString('X')
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddressModule -Value $StartAddressModule
+                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddressModuleSigned -Value $Signed
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddressPrivate -Value $PrivatePage
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name Size -Value $memory_basic_info.RegionSize
+                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name Size -Value $MemoryBasicInfo.RegionSize
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name TailBytes -Value $TailBytes
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name StartBytes -Value $StartBytes
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name Detections -Value $Detections
@@ -435,8 +453,8 @@ function SuspiciousCrtThreadStartReturnAddress {
     # TODO(jdu) handle 32-bit ...
 
     # 1. Query the THREAD_BASIC_INFORMATION to determine the location of the Thread Environment Block (TEB)
-    $thread_basic_info = [Activator]::CreateInstance($THREAD_BASIC_INFORMATION)
-    $NtStatus = $Ntdll::NtQueryInformationThread($ThreadHandle, 0, [Ref]$thread_basic_info, $THREAD_BASIC_INFORMATION::GetSize(), [IntPtr]::Zero)
+    $ThreadBasicInfo = [Activator]::CreateInstance($THREAD_BASIC_INFORMATION)
+    $NtStatus = $Ntdll::NtQueryInformationThread($ThreadHandle, 0, [Ref]$ThreadBasicInfo, $THREAD_BASIC_INFORMATION::GetSize(), [IntPtr]::Zero)
     if ($NtStatus -ne 0) {
         $LastError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
         throw "NtQueryInformationThread Error: $(([ComponentModel.Win32Exception] $LastError).Message)"
@@ -444,9 +462,9 @@ function SuspiciousCrtThreadStartReturnAddress {
 
     # 2. The TIB is the first elemenet of the TEB. Read the TIB to determine the stack limits.
     # TODO(jdu) Urgh. Powershell help needed... there must be a neater way...
-    $buf = ReadProcessMemory -ProcessHandle $ProcessHandle -BaseAddress $thread_basic_info.TebBaseAddress -Size $TIB64::GetSize()
+    $Buffer = ReadProcessMemory -ProcessHandle $ProcessHandle -BaseAddress $ThreadBasicInfo.TebBaseAddress -Size $TIB64::GetSize()
     $TibPtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($TIB64::GetSize())
-    [System.Runtime.InteropServices.Marshal]::Copy($buf, 0, $TibPtr, $TIB64::GetSize())
+    [System.Runtime.InteropServices.Marshal]::Copy($Buffer, 0, $TibPtr, $TIB64::GetSize())
     $Tib = $TibPtr -as $TIB64
 
     # 3. Read the (partial) stack contents
@@ -468,16 +486,16 @@ function SuspiciousCrtThreadStartReturnAddress {
         [System.Runtime.InteropServices.Marshal]::Copy($StackBuffer, ($StackReadLength - $i), $RspBuffer, [IntPtr]::Size)
         $CandidateRsp = [System.Runtime.InteropServices.Marshal]::ReadInt64($RspBuffer)
         if ($CandidateRsp -ne 0) {
-            $memory_basic_info = VirtualQueryEx -ProcessHandle $ProcessHandle -BaseAddress $CandidateRsp
-            if ($memory_basic_info.State -eq $MemState::MEM_COMMIT -and
-                ($memory_basic_info.Protect -eq $MemProtection::PAGE_EXECUTE -or
-                    $memory_basic_info.Protect -eq $MemProtection::PAGE_EXECUTE_READ -or
-                    $memory_basic_info.Protect -eq $MemProtection::PAGE_EXECUTE_READWRITE -or
-                    $memory_basic_info.Protect -eq $MemProtection::PAGE_EXECUTE_WRITECOPY)) {
+            $MemoryBasicInfo = VirtualQueryEx -ProcessHandle $ProcessHandle -BaseAddress $CandidateRsp
+            if ($MemoryBasicInfo.State -eq $MemState::MEM_COMMIT -and
+                ($MemoryBasicInfo.Protect -eq $MemProtection::PAGE_EXECUTE -or
+                    $MemoryBasicInfo.Protect -eq $MemProtection::PAGE_EXECUTE_READ -or
+                    $MemoryBasicInfo.Protect -eq $MemProtection::PAGE_EXECUTE_READWRITE -or
+                    $MemoryBasicInfo.Protect -eq $MemProtection::PAGE_EXECUTE_WRITECOPY)) {
                 # 5. Is this the 4th return address on the stack?
                 # Note - at this stack depth it is unlikely, but not impossible, that we encounter a
                 # false positive return address on the stack.
-                $NonImageFound = $NonImageFound -or ($memory_basic_info.Type -ne $MemType::MEM_IMAGE)
+                $NonImageFound = $NonImageFound -or ($MemoryBasicInfo.Type -ne $MemType::MEM_IMAGE)
                 $CandidateRspModule = GetMappedFileName -ProcessHandle $hProcess -Address $CandidateRsp
                 if ($CrtFound -and ($CandidateRspModule -notmatch $CrtRegex)) {
                     $Rsp = $CandidateRsp
@@ -1620,10 +1638,10 @@ $FunctionDefinitions = @(
     ) -SetLastError),
     
     (func kernel32 ReadProcessMemory ([Bool]) @(
-        [IntPtr],                                  # _In_ HANDLE hProcess
+        [IntPtr],                                  # _In_ HANDLE  hProcess
         [IntPtr],                                  # _In_ LPCVOID lpBaseAddress
-        [Byte[]],                                  # _Out_ LPVOID  lpBuffer
-        [Int],                                     # _In_ SIZE_T nSize
+        [Byte[]],                                  # _Out_ LPVOID lpBuffer
+        [Int],                                     # _In_ SIZE_T  nSize
         [Int].MakeByRefType()                      # _Out_ SIZE_T *lpNumberOfBytesRead
     ) -SetLastError),
     
@@ -1643,13 +1661,19 @@ $FunctionDefinitions = @(
 		[IntPtr]                                     #_In_  HANDLE hProcess,
 		[IntPtr]                                     #_In_  LPVOID lpv,
 		[System.Text.StringBuilder]                  #_Out_ LPTSTR lpFilename,
-		[Int32]                                      #_In_  DWORD nSize
+		[Int32]                                      #_In_  DWORD  nSize
+	) -SetLastError),
+
+    (func kernel32 QueryDosDevice ([Int32]) @(
+		[String]                                     #_In_  LPCWSTR lpDeviceName,
+        [System.Text.StringBuilder]                  #_Out_ LPWSTR  lpTargetPath,
+		[Int32]                                      #_In_  DWORD   ucchMax
 	) -SetLastError),
 
     (func kernel32 K32QueryWorkingSetEx ([Bool]) @(
 		[IntPtr]                                     #_In_  HANDLE hProcess,
-		$WORKING_SET_EX_INFORMATION.MakeByRefType(), #_In_  PVOID pv,
-		[Int32]                                      #_In_  DWORD cb
+		$WORKING_SET_EX_INFORMATION.MakeByRefType(), #_In_  PVOID  pv,
+		[Int32]                                      #_In_  DWORD  cb
 	) -SetLastError)
 )
 
@@ -1846,18 +1870,22 @@ function GetTokenInformation
             3 # TokenPrivilege
             {
                 # query the process token with the TOKEN_INFORMATION_CLASS = 3 enum to retrieve a TOKEN_PRIVILEGES structure
-                $TokenPrivileges = $TokenPtr -as $TOKEN_PRIVILEGES
-                
-                $sb = New-Object System.Text.StringBuilder
-                
-                for($i=0; $i -lt $TokenPrivileges.PrivilegeCount; $i++) 
+                try
                 {
-                    if((($TokenPrivileges.Privileges[$i].Attributes -as $LuidAttributes) -band $LuidAttributes::SE_PRIVILEGE_ENABLED) -eq $LuidAttributes::SE_PRIVILEGE_ENABLED)
+                    $TokenPrivileges = $TokenPtr -as $TOKEN_PRIVILEGES
+                
+                    $sb = New-Object System.Text.StringBuilder
+                
+                    for ($i = 0; $i -lt $TokenPrivileges.PrivilegeCount; $i++) 
                     {
-                       $sb.Append(", $($TokenPrivileges.Privileges[$i].Luid.LowPart.ToString())") | Out-Null  
+                        if ((($TokenPrivileges.Privileges[$i].Attributes -as $LuidAttributes) -band $LuidAttributes::SE_PRIVILEGE_ENABLED) -eq $LuidAttributes::SE_PRIVILEGE_ENABLED)
+                        {
+                            $sb.Append(", $($TokenPrivileges.Privileges[$i].Luid.LowPart.ToString())") | Out-Null
+                        }
                     }
+                    Write-Output $sb.ToString().TrimStart(', ')
                 }
-                Write-Output $sb.ToString().TrimStart(', ')
+                catch {}
             }
             17 # TokenOrigin
             {
@@ -1960,16 +1988,16 @@ function NtQueryInformationThread_Win32StartAddress
     ))
     #>
     
-    $buf = [System.Runtime.InteropServices.Marshal]::AllocHGlobal([IntPtr]::Size)
+    $Buffer = [System.Runtime.InteropServices.Marshal]::AllocHGlobal([IntPtr]::Size)
 
-    $NtStatus = $Ntdll::NtQueryInformationThread($ThreadHandle, 9, $buf, [IntPtr]::Size, [IntPtr]::Zero); $LastError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    $NtStatus = $Ntdll::NtQueryInformationThread($ThreadHandle, 9, $Buffer, [IntPtr]::Size, [IntPtr]::Zero); $LastError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
 
     if($NtStatus -ne 0)
     {
         Write-Debug "NtQueryInformationThread Error: $(([ComponentModel.Win32Exception] $LastError).Message)"
     }
     
-    Write-Output ([System.Runtime.InteropServices.Marshal]::ReadIntPtr($buf))
+    Write-Output ([System.Runtime.InteropServices.Marshal]::ReadIntPtr($Buffer))
 }
 
 function OpenProcess
@@ -2415,17 +2443,17 @@ function ReadProcessMemory
     ) -SetLastError) # MSDN states to call GetLastError if the return value is false. 
     #>
     
-    $buf = New-Object byte[]($Size)
+    $Buffer = New-Object byte[]($Size)
     [Int32]$NumberOfBytesRead = 0
     
-    $Success = $Kernel32::ReadProcessMemory($ProcessHandle, $BaseAddress, $buf, $buf.Length, [ref]$NumberOfBytesRead); $LastError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    $Success = $Kernel32::ReadProcessMemory($ProcessHandle, $BaseAddress, $Buffer, $Buffer.Length, [ref]$NumberOfBytesRead); $LastError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
 
     if(-not $Success) 
     {
         Write-Debug "ReadProcessMemory Error: $(([ComponentModel.Win32Exception] $LastError).Message)"
     }
     
-    Write-Output $buf
+    Write-Output $Buffer
 }
 
 function VirtualQueryEx
@@ -2474,15 +2502,15 @@ function VirtualQueryEx
     ) -SetLastError)
     #>
     
-    $memory_basic_info = [Activator]::CreateInstance($MEMORYBASICINFORMATION)
-    $BytesWritten = $Kernel32::VirtualQueryEx($ProcessHandle, $BaseAddress, [Ref]$memory_basic_info, $MEMORYBASICINFORMATION::GetSize()); $LastError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    $MemoryBasicInfo = [Activator]::CreateInstance($MEMORYBASICINFORMATION)
+    $BytesWritten = $Kernel32::VirtualQueryEx($ProcessHandle, $BaseAddress, [Ref]$MemoryBasicInfo, $MEMORYBASICINFORMATION::GetSize()); $LastError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
 
     if($BytesWritten -eq 0)
     {
         Write-Debug "VirtualQueryEx Error: $(([ComponentModel.Win32Exception] $LastError).Message)"
     }
     
-    Write-Output $memory_basic_info
+    Write-Output $MemoryBasicInfo
 }
 
 function IsWow64Process
@@ -2576,20 +2604,38 @@ function GetMappedFileName
         [System.Text.StringBuilder]                  #_Out_ LPTSTR lpFilename,
         [UInt32]                                     #_In_  DWORD nSize
     ) -SetLastError)
+
+    (func kernel32 QueryDosDevice ([Int32]) @(
+		[String]                                     #_In_  LPCWSTR lpDeviceName,
+        [System.Text.StringBuilder]                  #_Out_ LPWSTR  lpTargetPath,
+		[Int32]                                      #_In_  DWORD   ucchMax
+	) -SetLastError)
     #>
 
-    $capacity = 2048
-    $sb = New-Object -TypeName System.Text.StringBuilder($capacity)
+    $Capacity = 2048
+    $StringBuffer = New-Object -TypeName System.Text.StringBuilder($Capacity)
 
-    $BytesCopied = $Kernel32::K32GetMappedFileName($ProcessHandle, $Address, $sb, $capacity);
-
+    # K32GetMappedFileName returns a device name such as \Device\Harddisk0\Windows\System32\ntdll.dll
+    $BytesCopied = $Kernel32::K32GetMappedFileName($ProcessHandle, $Address, $StringBuffer, $Capacity);
     if ($BytesCopied -eq 0)
     {
         $LastError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
         Write-Debug "GetMappedFileName Error: $(([ComponentModel.Win32Exception] $LastError).Message)"
     }
+    $Path = $StringBuffer.ToString()
 
-    Write-Output $sb.ToString()
+    # Replace all device volume names with their drive letters
+    Get-WmiObject Win32_Volume |
+    Where-Object { $_.DriveLetter } |
+    ForEach-Object {
+        $BytesCopied = $Kernel32::QueryDosDevice($_.DriveLetter, $StringBuffer, $Capacity)
+        if ($BytesCopied -ne 0)
+        {
+            $Path = $Path -replace "^$([regex]::Escape($StringBuffer.ToString()))", $_.DriveLetter
+        }
+    }
+
+    Write-Output $Path
 }
 
 
@@ -2638,9 +2684,9 @@ function IsWorkingSetPage
         ) -SetLastError)
         #>
 
-    $working_set_info = [Activator]::CreateInstance($WORKING_SET_EX_INFORMATION)
-    $working_set_info.VirtualAddress = $Address
-    $Success = $Kernel32::K32QueryWorkingSetEx($ProcessHandle, [Ref]$working_set_info, $WORKING_SET_EX_INFORMATION::GetSize());
+    $WorkingSetInfo = [Activator]::CreateInstance($WORKING_SET_EX_INFORMATION)
+    $WorkingSetInfo.VirtualAddress = $Address
+    $Success = $Kernel32::K32QueryWorkingSetEx($ProcessHandle, [Ref]$WorkingSetInfo, $WORKING_SET_EX_INFORMATION::GetSize());
 
     if (-not $Success)
     {
@@ -2648,8 +2694,8 @@ function IsWorkingSetPage
         Write-Debug "QueryWorkingSetEx Error: $(([ComponentModel.Win32Exception] $LastError).Message)"
     }
 
-    $IsPrivate = ($working_set_info.VirtualAttributes.ToInt64() -band $WORKING_SET_EX_BLOCK::Valid) -eq $WORKING_SET_EX_BLOCK::Valid -and
-    ($working_set_info.VirtualAttributes.ToInt64() -band $WORKING_SET_EX_BLOCK::Shared) -ne $WORKING_SET_EX_BLOCK::Shared
+    $IsPrivate = ($WorkingSetInfo.VirtualAttributes.ToInt64() -band $WORKING_SET_EX_BLOCK::Valid) -eq $WORKING_SET_EX_BLOCK::Valid -and
+    ($WorkingSetInfo.VirtualAttributes.ToInt64() -band $WORKING_SET_EX_BLOCK::Shared) -ne $WORKING_SET_EX_BLOCK::Shared
     Write-Output $IsPrivate
 }
 
