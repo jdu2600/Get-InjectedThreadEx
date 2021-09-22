@@ -94,6 +94,19 @@ function Get-InjectedThreadEx
 
         Write-Verbose -Message "Checking $($Process.Name) [$($Process.Id)] for injection"
         $IsWow64Process = IsWow64Process -ProcessHandle $hProcess
+        $WmiProcess = Get-WmiObject Win32_Process -Filter "ProcessId = '$($Process.Id)'"
+        $ProcessKernelPath = QueryFullProcessImageName -ProcessHandle $hProcess
+        if(-not $ProcessKernelPath)
+        {
+            continue # process has stopped
+        }
+        $PathMismatch = $Process.Path.ToLower() -ne $ProcessKernelPath.ToLower()
+
+        if(-not $AuthenticodeSignatures.ContainsKey($ProcessKernelPath))
+        {
+            $AuthenticodeSignatures[$ProcessKernelPath] = Get-AuthenticodeSignature -FilePath $ProcessKernelPath
+        }
+        $ProcessModuleSigned = $AuthenticodeSignatures[$ProcessKernelPath].Status -eq 'Valid'
 
         $hProcessToken = OpenProcessToken -ProcessHandle $hProcess -DesiredAccess TOKEN_QUERY
         if($hProcessToken -ne 0)
@@ -144,7 +157,7 @@ function Get-InjectedThreadEx
             $MemoryType = $MemoryBasicInfo.Type -as $MemType
 
             # Win32StartAddress module information
-            $Signed = $false
+            $StartAddressModuleSigned = $false
             $IsMicrosoftModule = $false
             if($MemoryType -eq $MemType::MEM_IMAGE)
             {
@@ -153,9 +166,9 @@ function Get-InjectedThreadEx
                 {
                     $AuthenticodeSignatures[$StartAddressModule] = Get-AuthenticodeSignature -FilePath $StartAddressModule
                 }
-                $AuthenticodeSignature = $AuthenticodeSignatures
-                $Signed = $AuthenticodeSignature.Status -eq 'Valid'
-                if($Signed)
+                $AuthenticodeSignature = $AuthenticodeSignatures[$StartAddressModule]
+                $StartAddressModuleSigned = $AuthenticodeSignature.Status -eq 'Valid'
+                if($StartAddressModuleSigned)
                 {
                     $Signer = $AuthenticodeSignature.SignerCertificate.Subject
                     $IsMicrosoftModule = $Signer -match 'Microsoft'
@@ -180,6 +193,7 @@ function Get-InjectedThreadEx
                 # original
                 #  - not MEM_IMAGE
                 # new
+                #  - MEM_IMAGE and unsigned dll in signed exe
                 #  - MEM_IMAGE and x64 and Win32StartAddress is not 16-byte aligned
                 #  - MEM_IMAGE and x64 and Win32StartAddress is unexpected prolog
                 #  - MEM_IMAGE and Win32StartAddress is preceded by unexpected byte
@@ -188,6 +202,11 @@ function Get-InjectedThreadEx
                 #  - Thread has a higher integrity level than process
                 #  - Thread has additional unexpected privileges
                 $Detections = @()
+
+                if($ProcessModuleSigned -and -not $StartAddressModuleSigned)
+                {
+                    $Detections += "unsigned"
+                }
 
                 # All threads not starting in a MEM_IMAGE region are suspicious
                 if ($MemoryType -ne $MemType::MEM_IMAGE)
@@ -258,6 +277,7 @@ function Get-InjectedThreadEx
 
                 $x86PrologRegex = '^(' +
                 '(8bff)?55(8bec|89e5)' +       # stack pointer
+                '|(..)+81ec' +                 # sub esp,nnnn
                 '|(6a..|(68|b8)........)*e8' + # call
                 '|e9|ff25' +                   # jmp
                 '|4d5a90000300000004000000ffff0000b8000000000000004000000000000000' + # CLR Assembly
@@ -292,7 +312,7 @@ function Get-InjectedThreadEx
 
                 # Suspicious start modules
                 # https://www.trustedsec.com/blog/avoiding-get-injectedthread-for-internal-thread-creation/
-                $crt = '^\\Device\\HarddiskVolume\d+\\Windows\\System32\\(msvcr[t0-9]+|ucrtbase)d?\.dll$'
+                $crt = '[A-Z]:\\Windows\\System32\\(msvcr[t0-9]+|ucrtbase)d?\.dll$'
                 # https://docs.microsoft.com/en-us/cpp/c-runtime-library/reference/beginthread-beginthreadex
                 # crt!_startthread[ex] - the CRT wrapper around CreateThread
                 # This will *false positive* on legitimate CRT applications...
@@ -344,7 +364,7 @@ function Get-InjectedThreadEx
 
                     # Known additional privileges
                     # SysMain (sechost.dll) -> SeTakeOwnership
-                    $SysMainService = '\\Device\\HarddiskVolume\d+\\Windows\\System32\\sechost.dll'
+                    $SysMainService = '^[A-Z]:\\Windows\\System32\\sechost.dll$'
 
                     if (($NewPrivileges.Length -ne 0) -and
                         -not ($StartAddressModule -match $SysMainService -and $NewPrivileges -eq 'SeTakeOwnershipPrivilege'))
@@ -356,16 +376,12 @@ function Get-InjectedThreadEx
 
                 if ($Detections.Length -ne 0)
                 {
-                    $WmiProcess = Get-WmiObject Win32_Process -Filter "ProcessId = '$($Process.Id)'"
-                    $KernelPath = QueryFullProcessImageName -ProcessHandle $hProcess
-                    $PathMismatch = $Process.Path.ToLower() -ne $KernelPath.ToLower()
-
                     $ThreadDetail = New-Object PSObject
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessName -Value $WmiProcess.Name
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessId -Value $WmiProcess.ProcessId
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name Wow64 -Value $IsWow64Process
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name Path -Value $WmiProcess.Path
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name KernelPath -Value $KernelPath
+                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name KernelPath -Value $ProcessKernelPath
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name CommandLine -Value $WmiProcess.CommandLine
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name PathMismatch -Value $PathMismatch
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessIntegrity -Value $ProcessIntegrity
@@ -395,7 +411,7 @@ function Get-InjectedThreadEx
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name MemoryType -Value $MemoryType
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddress -Value $Win32StartAddress.ToString('X')
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddressModule -Value $StartAddressModule
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddressModuleSigned -Value $Signed
+                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddressModuleSigned -Value $StartAddressModuleSigned
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddressPrivate -Value $PrivatePage
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name Size -Value $MemoryBasicInfo.RegionSize
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name TailBytes -Value $TailBytes
@@ -479,9 +495,9 @@ function SuspiciousCrtThreadStartReturnAddress {
     $Kernel32Found = $false
     $CrtFound = $false
     $NonImageFound = $false
-    $NtdllRegex = '^\\Device\\HarddiskVolume\d+\\Windows\\System32\\ntdll\.dll$'
-    $Kernel32Regex = '^\\Device\\HarddiskVolume\d+\\Windows\\System32\\kernel32\.dll$'
-    $CrtRegex = '^\\Device\\HarddiskVolume\d+\\Windows\\System32\\(msvcr[t0-9]+|ucrtbase)d?\.dll$'
+    $NtdllRegex = '^[A-Z]:\\Windows\\System32\\ntdll\.dll$'
+    $Kernel32Regex = '^[A-Z]:\\Windows\\System32\\kernel32\.dll$'
+    $CrtRegex = '^[A-Z]:\\Windows\\System32\\(msvcr[t0-9]+|ucrtbase)d?\.dll$'
     for ($i = 8; $Rsp -eq 0 -and $i -lt $StackReadLength; $i += 8) {
         [System.Runtime.InteropServices.Marshal]::Copy($StackBuffer, ($StackReadLength - $i), $RspBuffer, [IntPtr]::Size)
         $CandidateRsp = [System.Runtime.InteropServices.Marshal]::ReadInt64($RspBuffer)
