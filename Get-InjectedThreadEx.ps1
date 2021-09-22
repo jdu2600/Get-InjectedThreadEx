@@ -77,8 +77,48 @@ function Get-InjectedThreadEx
         [Switch]$Aggressive
     )
 
-    $AuthenticodeSignatures = @{}
+    if(![Environment]::Is64BitProcess)
+    {
+        Write-Warning "32-bit not currently supported"
+    }
+
     $WindowsVersion = [Int]((Get-WmiObject Win32_OperatingSystem).version -split '\.')[0]
+
+    # Cache for signature checks
+    $AuthenticodeSignatures = @{}
+
+    # Construct a list of ntdll thread entry points
+    $NtdllRegex = '^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\ntdll\.dll$'
+    $NtdllThreads64 = @()
+    # [1] ntdll!RtlpQueryProcessDebugInformationRemote is exported - look it up.
+    $NtdllThreads64 += GetProcAddress -ModuleName "ntdll.dll" -ProcName "RtlpQueryProcessDebugInformationRemote"
+    # For the non-exported entry points, we check the Win32StartAddress of threads we trust.
+    # [2] ntdll!TppWorkerThread is already used by PowerShell :-)
+    # [3] ntdll!EtwpLogger is not exported, but is spawned in processes that use a Private ETW Logging Session
+    # https://docs.microsoft.com/en-us/windows/win32/etw/configuring-and-starting-a-private-logger-session
+    # Note - the PowerShell ETW CmdLets don't fully support private sessions.
+    # This means that we need to need start it asynchronously (-AsJob) or wait for a timeout.
+    # We also we can't stop it.
+    $EVENT_TRACE_PRIVATE_LOGGER_MODE = 0x800
+    $Job = New-EtwTraceSession -Name GetInjectedThreadEx -LogFileMode $EVENT_TRACE_PRIVATE_LOGGER_MODE -LocalFilePath "$($ENV:Temp)\GetInjectedThreadEx-tmp.etl" -AsJob
+    Start-Sleep -Milliseconds 500
+    $hProcess = OpenProcess -ProcessId $PID -DesiredAccess PROCESS_ALL_ACCESS -InheritHandle $false
+    foreach ($Thread in (Get-Process -Id $PID).Threads)
+    {
+        $hThread = OpenThread -ThreadId $Thread.Id -DesiredAccess THREAD_ALL_ACCESS
+        $Win32StartAddress = NtQueryInformationThread_Win32StartAddress -ThreadHandle $hThread
+        $StartAddressModule = GetMappedFileName -ProcessHandle $hProcess -Address $Win32StartAddress
+        if($StartAddressModule -match $NtdllRegex -and $Win32StartAddress -notin $NtdllThreads64)
+        {
+            $NtdllThreads64 += $Win32StartAddress
+        }
+    }
+    if($NtdllThreads64.Length -ne 3)
+    {
+        Write-Warning "Failed to enumerate all valid ntdll thread start addresses"
+    }
+
+    # Enumerate all threads and check for injection characteristics
     foreach($Process in (Get-Process))
     {
         if($Process.Id -eq 0 -or $Process.Id -eq 4)
@@ -124,7 +164,32 @@ function Get-InjectedThreadEx
             {
                 continue # skip thread - Access is Denied
             }
-            Write-Verbose -Message "Thread Id: [$($thread.Id)]"
+
+            # Win32StartAddress memory information
+            $Win32StartAddress = NtQueryInformationThread_Win32StartAddress -ThreadHandle $hThread
+            $MemoryBasicInfo = VirtualQueryEx -ProcessHandle $hProcess -BaseAddress $Win32StartAddress
+            $AllocatedMemoryProtection = $MemoryBasicInfo.AllocationProtect -as $MemProtection
+            $MemoryProtection = $MemoryBasicInfo.Protect -as $MemProtection
+            $MemoryState = $MemoryBasicInfo.State -as $MemState
+            $MemoryType = $MemoryBasicInfo.Type -as $MemType
+
+            # Win32StartAddress module information
+            $StartAddressModuleSigned = $false
+            if($MemoryType -eq $MemType::MEM_IMAGE)
+            {
+                $StartAddressModule = GetMappedFileName -ProcessHandle $hProcess -Address $Win32StartAddress
+                if(-not $AuthenticodeSignatures.ContainsKey($StartAddressModule))
+                {
+                    $AuthenticodeSignatures[$StartAddressModule] = Get-AuthenticodeSignature -FilePath $StartAddressModule
+                }
+                $AuthenticodeSignature = $AuthenticodeSignatures[$StartAddressModule]
+                $StartAddressModuleSigned = $AuthenticodeSignature.Status -eq 'Valid'
+                Write-Verbose -Message " * Thread Id: [$($thread.Id)] $($StartAddressModule) signed:$($StartAddressModuleSigned)"
+            }
+            else
+            {
+                Write-Verbose -Message " * Thread Id: [$($thread.Id)] $($MemoryType)"
+            }
 
             # check if thread has unique token
             $IsUniqueThreadToken = $false
@@ -148,33 +213,6 @@ function Get-InjectedThreadEx
             }
             catch {}
 
-            # Win32StartAddress memory information
-            $Win32StartAddress = NtQueryInformationThread_Win32StartAddress -ThreadHandle $hThread
-            $MemoryBasicInfo = VirtualQueryEx -ProcessHandle $hProcess -BaseAddress $Win32StartAddress
-            $AllocatedMemoryProtection = $MemoryBasicInfo.AllocationProtect -as $MemProtection
-            $MemoryProtection = $MemoryBasicInfo.Protect -as $MemProtection
-            $MemoryState = $MemoryBasicInfo.State -as $MemState
-            $MemoryType = $MemoryBasicInfo.Type -as $MemType
-
-            # Win32StartAddress module information
-            $StartAddressModuleSigned = $false
-            $IsMicrosoftModule = $false
-            if($MemoryType -eq $MemType::MEM_IMAGE)
-            {
-                $StartAddressModule = GetMappedFileName -ProcessHandle $hProcess -Address $Win32StartAddress
-                if(-not $AuthenticodeSignatures.ContainsKey($StartAddressModule))
-                {
-                    $AuthenticodeSignatures[$StartAddressModule] = Get-AuthenticodeSignature -FilePath $StartAddressModule
-                }
-                $AuthenticodeSignature = $AuthenticodeSignatures[$StartAddressModule]
-                $StartAddressModuleSigned = $AuthenticodeSignature.Status -eq 'Valid'
-                if($StartAddressModuleSigned)
-                {
-                    $Signer = $AuthenticodeSignature.SignerCertificate.Subject
-                    $IsMicrosoftModule = $Signer -match 'Microsoft'
-                }
-            }
-
             if ($MemoryState -eq $MemState::MEM_COMMIT)
             {
                 $StartBytesLength = [math]::Min(48, [UInt64]$MemoryBasicInfo.BaseAddress + [UInt64]$MemoryBasicInfo.RegionSize - [Int64]$Win32StartAddress)
@@ -193,20 +231,14 @@ function Get-InjectedThreadEx
                 # original
                 #  - not MEM_IMAGE
                 # new
-                #  - MEM_IMAGE and unsigned dll in signed exe
-                #  - MEM_IMAGE and x64 and Win32StartAddress is not 16-byte aligned
                 #  - MEM_IMAGE and x64 and Win32StartAddress is unexpected prolog
                 #  - MEM_IMAGE and Win32StartAddress is preceded by unexpected byte
                 #  - MEM_IMAGE and Win32StartAddress is on a private (modified) page
                 #  - MEM_IMAGE and Win32StartAddress is in a suspicious module
+                #  - MEM_IMAGE and x64 and Win32StartAddress is not 16-byte aligned (-Aggressive only)
                 #  - Thread has a higher integrity level than process
                 #  - Thread has additional unexpected privileges
                 $Detections = @()
-
-                if($ProcessModuleSigned -and -not $StartAddressModuleSigned)
-                {
-                    $Detections += "unsigned"
-                }
 
                 # All threads not starting in a MEM_IMAGE region are suspicious
                 if ($MemoryType -ne $MemType::MEM_IMAGE)
@@ -222,10 +254,10 @@ function Get-InjectedThreadEx
                 # as 'jmp rcx'
                 # https://blog.xpnsec.com/undersanding-and-evading-get-injectedthread/
                 #
-                # In practice, this has a high FP rate - so only check Microsoft binaries by default.
+                # In practice, this has a high FP rate - so don't check by default.
                 $EarlyCallRegex = '^(..)*?(e8|ff15)'
                 $ImmediateJumpRegex = '^(e9|(48)?ff25)'
-                if (($IsMicrosoftModule -or $Aggressive) -and
+                if ($Aggressive -and
                     (([Int64]$Win32StartAddress -band 0xF) -ne 0) -and
                     # If < Windows 10 then also allow 4-byte alignments
                     (($WindowsVersion -ge 10) -or (([Int64]$Win32StartAddress -band 3) -ne 0)))
@@ -277,7 +309,7 @@ function Get-InjectedThreadEx
 
                 $x86PrologRegex = '^(' +
                 '(8bff)?55(8bec|89e5)' +       # stack pointer
-                '|(..)+81ec' +                 # sub esp,nnnn
+                '|(..)+8[13]ec' +              # sub esp,nnnn
                 '|(6a..|(68|b8)........)*e8' + # call
                 '|e9|ff25' +                   # jmp
                 '|4d5a90000300000004000000ffff0000b8000000000000004000000000000000' + # CLR Assembly
@@ -291,8 +323,9 @@ function Get-InjectedThreadEx
                 # The byte preceding a function prolog is typically a return, or filler byte.
                 # False positives can occur if data was included in a code section. This was
                 # common in older compilers.
+                # In practice, this has a medium FP rate - so don't check by default.
                 $x64EpilogFillerRegex = '(00|90|c3|cc|(e8|e9|ff25)........|^)$'
-                if ($TailBytes -notmatch $x64EpilogFillerRegex)
+                if ($Aggressive -and ($TailBytes -notmatch $x64EpilogFillerRegex))
                 {
                     $Detections += 'tail'
                 }
@@ -310,30 +343,70 @@ function Get-InjectedThreadEx
                     $Detections += 'modified'
                 }
 
-                # Suspicious start modules
-                # https://www.trustedsec.com/blog/avoiding-get-injectedthread-for-internal-thread-creation/
-                $crt = '[A-Z]:\\Windows\\System32\\(msvcr[t0-9]+|ucrtbase)d?\.dll$'
-                # https://docs.microsoft.com/en-us/cpp/c-runtime-library/reference/beginthread-beginthreadex
+                ### Suspicious start modules
+
+                # unsigned module in signed process - e.g. dll sideloading
+                if($ProcessModuleSigned -and -not $StartAddressModuleSigned)
+                {
+                    $Detections += "unsigned"
+                }
+
                 # crt!_startthread[ex] - the CRT wrapper around CreateThread
+                # https://www.trustedsec.com/blog/avoiding-get-injectedthread-for-internal-thread-creation/
+                $CrtRegex = '^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\(msvcr[t0-9]+|ucrtbase)d?\.dll$'
+                # https://docs.microsoft.com/en-us/cpp/c-runtime-library/reference/beginthread-beginthreadex
                 # This will *false positive* on legitimate CRT applications...
                 # If we were in a kernel CreateThreadNotifyRoutine then we could inspect the function's
                 # parameter to determine the real Win32StartAddress.
                 # Instead we walk the thread's stack bottom up to find an approximate Win32StartAddress
                 # so we can eliminate the FPs.
-                if ($StartAddressModule -match $crt)
+                if ($StartAddressModule -match $CrtRegex)
                 {
                     if (-not $IsWow64Process)
                     {
-                        $Suspicious = SuspiciousCrtThreadStartReturnAddress -ProcessHandle $hProcess -ThreadHandle $hThread
+                        $Suspicious = SuspiciousWrappedThreadStartReturnAddress -ProcessHandle $hProcess -ThreadHandle $hThread -ModuleRegex $CrtRegex
                         if ($Suspicious)
                         {
                             $Detections += 'crt'
                         }
                     }
-                    else
+                    # TODO(jdu) Handle x86 FPs...
+                }
+
+                # SHCore!_WrapperThreadProc - the Shell32 wrapper around CreateThread
+                $SHCoreRegex = '^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\(SHCore|Shlwapi).dll$'
+                if ($StartAddressModule -match $SHCoreRegex)
+                {
+                    if (-not $IsWow64Process)
                     {
-                        $Detections += 'crt_x86_TODO'  # Handle x86 FPs...
+                        $Suspicious = SuspiciousWrappedThreadStartReturnAddress -ProcessHandle $hProcess -ThreadHandle $hThread -ModuleRegex $SHCoreRegex
+                        if ($Suspicious)
+                        {
+                            $Detections += 'shell32'
+                        }
                     }
+                    # TODO(jdu) Handle x86 FPs...
+                }
+
+                # kernel32!LoadLibrary
+                # There are no valid thread entry points in kernel32.
+                $Kernel32Regex = '^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\kernel(32|base)\.dll$'
+                if ($StartAddressModule -match $Kernel32Regex)
+                {
+                    $Detections += 'kernel32'
+                }
+
+                # ntdll.dll but not -
+                #  * ntdll!TppWorkerThread
+                #  * ntdll!EtwpLogger
+                #  * ntdll!RtlpQueryProcessDebugInformationRemote
+                # These are the only valid thread entry points in ntdll.
+                if (-not $IsWow64Process -and
+                    $NtdllThreads64.Length -eq 3 -and
+                    $StartAddressModule -match $NtdllRegex -and
+                    $Win32StartAddress -notin $NtdllThreads64)
+                {
+                    $Detections += 'ntdll'
                 }
 
                 if ($IsUniqueThreadToken)
@@ -371,7 +444,6 @@ function Get-InjectedThreadEx
                     {
                         $Detections += $NewPrivileges
                     }
-
                 }
 
                 if ($Detections.Length -ne 0)
@@ -409,7 +481,7 @@ function Get-InjectedThreadEx
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name MemoryProtection -Value $MemoryProtection
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name MemoryState -Value $MemoryState
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name MemoryType -Value $MemoryType
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddress -Value $Win32StartAddress.ToString('X')
+                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddress -Value $Win32StartAddress.ToString('x')
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddressModule -Value $StartAddressModule
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddressModuleSigned -Value $StartAddressModuleSigned
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddressPrivate -Value $PrivatePage
@@ -420,17 +492,17 @@ function Get-InjectedThreadEx
                     Write-Output $ThreadDetail
                 }
             }
+            CloseHandle($hThread)
         }
-        CloseHandle($hThread)
+        CloseHandle($hProcess)
     }
-    CloseHandle($hProcess)
 }
 
-function SuspiciousCrtThreadStartReturnAddress {
+function SuspiciousWrappedThreadStartReturnAddress {
     <#
     .SYNOPSIS
 
-    Checks the return address into the module that called crt!_beginthread[ex] for suspicious characteristics.
+    Checks the return address into the module that called the given CreateThread wrapper for suspicious characteristics.
 
     .DESCRIPTION
 
@@ -453,7 +525,12 @@ function SuspiciousCrtThreadStartReturnAddress {
 
         [Parameter(Mandatory = $true)]
         [IntPtr]
-        $ThreadHandle
+        $ThreadHandle,
+
+        [Parameter(Mandatory = $true)]
+        [String]
+        $ModuleRegex
+
     )
 
     <#
@@ -471,7 +548,8 @@ function SuspiciousCrtThreadStartReturnAddress {
     # 1. Query the THREAD_BASIC_INFORMATION to determine the location of the Thread Environment Block (TEB)
     $ThreadBasicInfo = [Activator]::CreateInstance($THREAD_BASIC_INFORMATION)
     $NtStatus = $Ntdll::NtQueryInformationThread($ThreadHandle, 0, [Ref]$ThreadBasicInfo, $THREAD_BASIC_INFORMATION::GetSize(), [IntPtr]::Zero)
-    if ($NtStatus -ne 0) {
+    if ($NtStatus -ne 0)
+    {
         $LastError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
         throw "NtQueryInformationThread Error: $(([ComponentModel.Win32Exception] $LastError).Message)"
     }
@@ -487,39 +565,53 @@ function SuspiciousCrtThreadStartReturnAddress {
     $StackReadLength = [math]::Min(0x3000, [Int64]$Tib.StackBase - [Int64]$Tib.StackLimit)
     $StackBuffer = ReadProcessMemory -ProcessHandle $ProcessHandle -BaseAddress ([Int64]$Tib.StackBase - $StackReadLength) -Size $StackReadLength
 
-    # 4. Search the stack bottom up for the return address immediately after the CRT wrapper.
-    # ntdll!RtlUserThreadStart -> kernel32!BaseThreadInitThunk -> CRT!_beginthread[ex] -> actual user start address
+    # 4. Search the stack bottom up for the return address immediately after the wrapper.
+    # ntdll!RtlUserThreadStart -> kernel32!BaseThreadInitThunk -> <wrapper> -> actual user start address
     $RspBuffer = [System.Runtime.InteropServices.Marshal]::AllocHGlobal([IntPtr]::Size)
     $Rsp = 0
     $NtdllFound = $false
     $Kernel32Found = $false
-    $CrtFound = $false
+    $WrapperFound = $false
     $NonImageFound = $false
     $NtdllRegex = '^[A-Z]:\\Windows\\System32\\ntdll\.dll$'
     $Kernel32Regex = '^[A-Z]:\\Windows\\System32\\kernel32\.dll$'
-    $CrtRegex = '^[A-Z]:\\Windows\\System32\\(msvcr[t0-9]+|ucrtbase)d?\.dll$'
-    for ($i = 8; $Rsp -eq 0 -and $i -lt $StackReadLength; $i += 8) {
+    for ($i = 8; $Rsp -eq 0 -and $i -lt $StackReadLength; $i += 16)
+    {
         [System.Runtime.InteropServices.Marshal]::Copy($StackBuffer, ($StackReadLength - $i), $RspBuffer, [IntPtr]::Size)
         $CandidateRsp = [System.Runtime.InteropServices.Marshal]::ReadInt64($RspBuffer)
-        if ($CandidateRsp -ne 0) {
+        if ($CandidateRsp -ne 0)
+        {
             $MemoryBasicInfo = VirtualQueryEx -ProcessHandle $ProcessHandle -BaseAddress $CandidateRsp
             if ($MemoryBasicInfo.State -eq $MemState::MEM_COMMIT -and
                 ($MemoryBasicInfo.Protect -eq $MemProtection::PAGE_EXECUTE -or
                     $MemoryBasicInfo.Protect -eq $MemProtection::PAGE_EXECUTE_READ -or
                     $MemoryBasicInfo.Protect -eq $MemProtection::PAGE_EXECUTE_READWRITE -or
-                    $MemoryBasicInfo.Protect -eq $MemProtection::PAGE_EXECUTE_WRITECOPY)) {
+                    $MemoryBasicInfo.Protect -eq $MemProtection::PAGE_EXECUTE_WRITECOPY))
+            {
                 # 5. Is this the 4th return address on the stack?
                 # Note - at this stack depth it is unlikely, but not impossible, that we encounter a
                 # false positive return address on the stack.
                 $NonImageFound = $NonImageFound -or ($MemoryBasicInfo.Type -ne $MemType::MEM_IMAGE)
-                $CandidateRspModule = GetMappedFileName -ProcessHandle $hProcess -Address $CandidateRsp
-                if ($CrtFound -and ($CandidateRspModule -notmatch $CrtRegex)) {
+                if($MemoryBasicInfo.Type -eq $MemType::MEM_IMAGE)
+                {
+                    $CandidateRspModule = GetMappedFileName -ProcessHandle $hProcess -Address $CandidateRsp
+                }
+                else
+                {
+                    $CandidateRspModule = $MemoryBasicInfo.Type -as $MemType
+                }
+
+                Write-Verbose -Message "  * Stack +0x$($i.ToString('x')): $($CandidateRspModule)"
+
+                if ($WrapperFound -and ($CandidateRspModule -notmatch $ModuleRegex))
+                {
                     $Rsp = $CandidateRsp
                 }
-                else {
+                else
+                {
                     $NtdllFound = $NtdllFound -or ($CandidateRspModule -match $NtdllRegex)
                     $Kernel32Found = $Kernel32Found -or ($NtdllFound -and ($CandidateRspModule -match $Kernel32Regex))
-                    $CrtFound = $CrtFound -or ($Kernel32Found -and ($CandidateRspModule -match $CrtRegex))
+                    $WrapperFound = $WrapperFound -or ($Kernel32Found -and ($CandidateRspModule -match $ModuleRegex))
                 }
             }
         }
@@ -527,7 +619,8 @@ function SuspiciousCrtThreadStartReturnAddress {
 
     # 6. Is our return address either not MEM_IMAGE or modified MEM_IMAGE?
     $Suspicious = $false
-    if ($Rsp -ne 0) {
+    if ($Rsp -ne 0)
+    {
         $PrivatePage = IsWorkingSetPage -ProcessHandle $hProcess -Address $Rsp
         $Suspicious = $NonImageFound -or $PrivatePage
     }
@@ -1422,18 +1515,6 @@ $SecurityEntity = psenum $Module SecurityEntity UInt32 @{
     SeCreateSymbolicLinkPrivilege       =   35
 }
 
-$SidNameUser = psenum $Module SID_NAME_USE UInt32 @{
-  SidTypeUser                            = 1
-  SidTypeGroup                           = 2
-  SidTypeDomain                          = 3
-  SidTypeAlias                           = 4
-  SidTypeWellKnownGroup                  = 5
-  SidTypeDeletedAccount                  = 6
-  SidTypeInvalid                         = 7
-  SidTypeUnknown                         = 8
-  SidTypeComputer                        = 9
-}
-
 $THREAD_ACCESS = psenum $Module THREAD_ACCESS UInt32 @{
     THREAD_TERMINATE                 = 0x00000001
     THREAD_SUSPEND_RESUME            = 0x00000002
@@ -1515,6 +1596,11 @@ $TokenInformationClass = psenum $Module TOKEN_INFORMATION_CLASS UInt16 @{
   TokenIsRestricted                     = 40
   MaxTokenInfoClass                     = 41
 }
+
+$WORKING_SET_EX_BLOCK = psenum $Module WORKING_SET_EX_BLOCK UInt32 @{
+    Valid  = 0x00000001
+    Shared = 0x00008000
+} -Bitfield
 #endregion Enums
 
 #region Structs
@@ -1545,10 +1631,6 @@ $SID_AND_ATTRIBUTES = struct $Module SidAndAttributes @{
 
 $TOKEN_MANDATORY_LABEL = struct $Module TokenMandatoryLabel @{
     Label           = field 0 $SID_AND_ATTRIBUTES;
-}
-
-$TOKEN_ORIGIN = struct $Module TokenOrigin @{
-  OriginatingLogonSession = field 0 UInt64
 }
 
 $TOKEN_PRIVILEGES = struct $Module TokenPrivileges @{
@@ -1690,7 +1772,16 @@ $FunctionDefinitions = @(
 		[IntPtr]                                     #_In_  HANDLE hProcess,
 		$WORKING_SET_EX_INFORMATION.MakeByRefType(), #_In_  PVOID  pv,
 		[Int32]                                      #_In_  DWORD  cb
-	) -SetLastError)
+	) -SetLastError),
+
+    (func kernel32 GetModuleHandle ([IntPtr]) @(
+        [String]                                     #_In_  LPCSTR lpModuleName
+	) -SetLastError),
+
+    (func kernel32 GetProcAddress ([IntPtr]) @(
+		[IntPtr]                                     #_In_  HANDLE hModule,
+        [String]                                     #_In_  LPCSTR lpProcName
+	) -Charset Ansi -SetLastError)
 )
 
 $Types = $FunctionDefinitions | Add-Win32Type -Module $Module -Namespace 'Win32SysInfo'
@@ -2658,29 +2749,29 @@ function GetMappedFileName
 function IsWorkingSetPage
 {
     <#
-        .SYNOPSIS
+    .SYNOPSIS
 
-        Checks whether the specified address is within the working set of the specified process.
-        For MEM_IMAGE pages, this indicates that it has been locally modified.
+    Checks whether the specified address is within the working set of the specified process.
+    For MEM_IMAGE pages, this indicates that it has been locally modified.
 
-        .PARAMETER ProcessHandle
+    .PARAMETER ProcessHandle
 
-        A handle to the process. This handle must be created with the PROCESS_QUERY_INFORMATION access right.
+    A handle to the process. This handle must be created with the PROCESS_QUERY_INFORMATION access right.
 
-        .PARAMETER Address
+    .PARAMETER Address
 
-        The address to be checked.
+    The address to be checked.
 
-        .NOTES
+    .NOTES
 
-        Author - John Uhlmann (@jdu2600)
+    Author - John Uhlmann (@jdu2600)
 
-        .LINK
+    .LINK
 
-        https://docs.microsoft.com/en-us/windows/win32/api/psapi/nf-psapi-queryworkingsetex
+    https://docs.microsoft.com/en-us/windows/win32/api/psapi/nf-psapi-queryworkingsetex
 
-        .EXAMPLE
-        #>
+    .EXAMPLE
+    #>
 
     param
     (
@@ -2698,7 +2789,7 @@ function IsWorkingSetPage
             [IntPtr]                                     #_In_  PVOID pv,
             [Int32]                                      #_In_  DWORD cb
         ) -SetLastError)
-        #>
+    #>
 
     $WorkingSetInfo = [Activator]::CreateInstance($WORKING_SET_EX_INFORMATION)
     $WorkingSetInfo.VirtualAddress = $Address
@@ -2715,4 +2806,67 @@ function IsWorkingSetPage
     Write-Output $IsPrivate
 }
 
+function GetProcAddress
+{
+    <#
+    .SYNOPSIS
+
+    Retrieves the address of an exported function or variable from the specified module.
+
+    .PARAMETER ModuleName
+
+    The module name. It must already be loaded in the current process.
+
+    .PARAMETER ProcName
+
+    The function or variable name.
+
+    .NOTES
+
+    Author - John Uhlmann (@jdu2600)
+
+    .LINK
+
+    https://docs.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getprocaddress
+
+    .EXAMPLE
+    #>
+
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [string]
+        $ModuleName,
+
+        [Parameter(Mandatory = $true)]
+        [string]
+        $ProcName
+    )
+    <#
+    (func kernel32 GetModuleHandle ([IntPtr]) @(
+        [String]                                     #_In_  LPCSTR lpModuleName
+	) -SetLastError),
+
+    (func kernel32 GetProcAddress ([IntPtr]) @(
+		[IntPtr]                                     #_In_  HANDLE hModule,
+        [String]                                     #_In_  LPCSTR lpProcName
+	) -Charset Ansi -SetLastError)
+    #>
+
+    $hModule  = $Kernel32::GetModuleHandle($ModuleName)
+    if ($hModule -eq 0)
+    {
+        $LastError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        Write-Debug "GetModuleHandle Error: $(([ComponentModel.Win32Exception] $LastError).Message)"
+    }
+
+    $ProcAddress = $Kernel32::GetProcAddress($hModule, $ProcName)
+    if ($ProcAddress -eq 0)
+    {
+        $LastError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        Write-Debug "GetProcAddress Error: $(([ComponentModel.Win32Exception] $LastError).Message)"
+    }
+
+    Write-Output $ProcAddress
+}
 #endregion Win32 API Abstractions
