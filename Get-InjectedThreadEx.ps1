@@ -79,7 +79,7 @@ function Get-InjectedThreadEx
 
     if(![Environment]::Is64BitProcess)
     {
-        Write-Warning "32-bit not currently supported"
+        Write-Warning "32-bit not currently supported."
     }
 
     $WindowsVersion = [Int]((Get-WmiObject Win32_OperatingSystem).version -split '\.')[0]
@@ -99,26 +99,34 @@ function Get-InjectedThreadEx
     # Note - the PowerShell ETW CmdLets don't fully support private sessions.
     # This means that we need to need start it asynchronously (-AsJob) or wait for a timeout.
     # We also we can't stop it.
-    $EVENT_TRACE_PRIVATE_LOGGER_MODE = 0x800
-    $Job = New-EtwTraceSession -Name GetInjectedThreadEx -LogFileMode $EVENT_TRACE_PRIVATE_LOGGER_MODE -LocalFilePath "$($ENV:Temp)\GetInjectedThreadEx-tmp.etl" -AsJob
-    Start-Sleep -Milliseconds 500
+    try
+    {
+        $EVENT_TRACE_PRIVATE_LOGGER_MODE = 0x800
+        $Job = New-EtwTraceSession -Name GetInjectedThreadEx -LogFileMode $EVENT_TRACE_PRIVATE_LOGGER_MODE -LocalFilePath "$($ENV:Temp)\GetInjectedThreadEx-tmp.etl" -AsJob
+        Start-Sleep -Milliseconds 500
+    }
+    catch
+    {
+        Write-Warning "New-EtwTraceSession not found. Can't find ntdll!EtwpLogger."
+    }
+    # Loop over our process's threads to find the valid ntdll threat start adddresses
     $hProcess = OpenProcess -ProcessId $PID -DesiredAccess PROCESS_ALL_ACCESS -InheritHandle $false
     foreach ($Thread in (Get-Process -Id $PID).Threads)
     {
         $hThread = OpenThread -ThreadId $Thread.Id -DesiredAccess THREAD_ALL_ACCESS
         $Win32StartAddress = NtQueryInformationThread_Win32StartAddress -ThreadHandle $hThread
         $StartAddressModule = GetMappedFileName -ProcessHandle $hProcess -Address $Win32StartAddress
-        if($StartAddressModule -match $NtdllRegex -and $Win32StartAddress -notin $NtdllThreads64)
+        if($StartAddressModule -match $NtdllRegex -and $NtdllThreads64 -notcontains $Win32StartAddress)
         {
             $NtdllThreads64 += $Win32StartAddress
         }
     }
     if($NtdllThreads64.Length -ne 3)
     {
-        Write-Warning "Failed to enumerate all valid ntdll thread start addresses"
+        Write-Warning "Failed to enumerate all valid ntdll thread start addresses."
     }
 
-    # Enumerate all threads and check for injection characteristics
+    # Now enumerate all threads for all processes and check for injection characteristics
     foreach($Process in (Get-Process))
     {
         if($Process.Id -eq 0 -or $Process.Id -eq 4)
@@ -133,6 +141,8 @@ function Get-InjectedThreadEx
         }
 
         Write-Verbose -Message "Checking $($Process.Name) [$($Process.Id)] for injection"
+
+        # Collect per-process information
         $IsWow64Process = IsWow64Process -ProcessHandle $hProcess
         $WmiProcess = Get-WmiObject Win32_Process -Filter "ProcessId = '$($Process.Id)'"
         $ProcessKernelPath = QueryFullProcessImageName -ProcessHandle $hProcess
@@ -157,6 +167,7 @@ function Get-InjectedThreadEx
             $ProcessIntegrity = GetTokenInformation -TokenHandle $hProcessToken -TokenInformationClass 25
         }
 
+        # Now loop over this process's threads
         foreach ($thread in $Process.Threads)
         {
             $hThread = OpenThread -ThreadId $thread.Id -DesiredAccess THREAD_ALL_ACCESS
@@ -232,9 +243,9 @@ function Get-InjectedThreadEx
                 #  - not MEM_IMAGE
                 # new
                 #  - MEM_IMAGE and x64 and Win32StartAddress is unexpected prolog
-                #  - MEM_IMAGE and Win32StartAddress is preceded by unexpected byte
                 #  - MEM_IMAGE and Win32StartAddress is on a private (modified) page
                 #  - MEM_IMAGE and Win32StartAddress is in a suspicious module
+                #  - MEM_IMAGE and Win32StartAddress is preceded by unexpected byte (-Aggressive only)
                 #  - MEM_IMAGE and x64 and Win32StartAddress is not 16-byte aligned (-Aggressive only)
                 #  - Thread has a higher integrity level than process
                 #  - Thread has additional unexpected privileges
@@ -346,9 +357,9 @@ function Get-InjectedThreadEx
                 ### Suspicious start modules
 
                 # unsigned module in signed process - e.g. dll sideloading
-                if($ProcessModuleSigned -and -not $StartAddressModuleSigned)
+                if($WindowsVersion -ge 10 -and $ProcessModuleSigned -and -not $StartAddressModuleSigned)
                 {
-                    $Detections += "unsigned"
+                    $Detections += 'unsigned'
                 }
 
                 # crt!_startthread[ex] - the CRT wrapper around CreateThread
@@ -401,10 +412,10 @@ function Get-InjectedThreadEx
                 #  * ntdll!EtwpLogger
                 #  * ntdll!RtlpQueryProcessDebugInformationRemote
                 # These are the only valid thread entry points in ntdll.
-                if (-not $IsWow64Process -and
-                    $NtdllThreads64.Length -eq 3 -and
-                    $StartAddressModule -match $NtdllRegex -and
-                    $Win32StartAddress -notin $NtdllThreads64)
+                if ((-not $IsWow64Process) -and
+                    ($NtdllThreads64.Length -eq 3) -and
+                    ($StartAddressModule -match $NtdllRegex) -and
+                    ($NtdllThreads64 -notcontains $Win32StartAddress))
                 {
                     $Detections += 'ntdll'
                 }
