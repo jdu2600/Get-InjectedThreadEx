@@ -87,6 +87,8 @@ function Get-InjectedThreadEx
     # Cache for signature checks
     $AuthenticodeSignatures = @{}
 
+    $CfgBitMapAddress = GetCfgBitMapAddress
+
     # Construct a list of ntdll thread entry points
     $NtdllRegex = '^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\ntdll\.dll$'
     $NtdllThreads64 = @()
@@ -244,6 +246,7 @@ function Get-InjectedThreadEx
                 # new
                 #  - MEM_IMAGE and x64 and Win32StartAddress is unexpected prolog
                 #  - MEM_IMAGE and Win32StartAddress is on a private (modified) page
+                #  - MEM_IMAGE and dll and Win32StartAddress entry in CFG BitMap is on a private (modified) page
                 #  - MEM_IMAGE and Win32StartAddress is in a suspicious module
                 #  - MEM_IMAGE and Win32StartAddress is preceded by unexpected byte (-Aggressive only)
                 #  - MEM_IMAGE and x64 and Win32StartAddress is not 16-byte aligned (-Aggressive only)
@@ -352,6 +355,16 @@ function Get-InjectedThreadEx
                     $PrivatePage)
                 {
                     $Detections += 'modified'
+                }
+
+                # Has the CFG BitMap entry for Win32StartAddress been modifed post load? e.g. SetProcessValidCallTargets
+                # Note - exe BitMap entries are not shared, only dll BitMap entries (or maybe only KnownDll dlls?).
+                if (([IntPtr]::Zero -ne $CfgBitMapAddress) -and
+                    ($MemoryType -eq $MemType::MEM_IMAGE) -and
+                    ($StartAddressModule -notmatch '\.exe$') -and
+                    (IsCfgBitMapPrivate -pCfgBitMap $CfgBitMapAddress -ProcessHandle $hProcess -Address $Win32StartAddress))
+                {
+                    $Detections += 'cfg_modifed'
                 }
 
                 ### Suspicious start modules
@@ -509,15 +522,14 @@ function Get-InjectedThreadEx
     }
 }
 
-function SuspiciousWrappedThreadStartReturnAddress {
+function GetCfgBitMapAddress
+{
     <#
     .SYNOPSIS
 
-    Checks the return address into the module that called the given CreateThread wrapper for suspicious characteristics.
+    Returns the address of ntdll!LdrSystemDllInitBlock.CfgBitMap, or Zero if CFG is not supported.
 
     .DESCRIPTION
-
-    .PARAMETER ThreadHandle
 
     .NOTES
 
@@ -527,6 +539,138 @@ function SuspiciousWrappedThreadStartReturnAddress {
 
     .EXAMPLE
     #>
+
+    # Find non-exported ntdll!LdrSystemDllInitBlock.CfgBitMap
+    # 180033520  ntdll!LdrControlFlowGuardEnforced
+    # 180033520  48833d80be140000  CMP qword ptr[LdrSystemDllInitBlock.CfgBitMap], 0x0
+    $LdrControlFlowGuardEnforced = GetProcAddress -ModuleName "ntdll.dll" -ProcName "LdrControlFlowGuardEnforced"
+    if($LdrControlFlowGuardEnforced -eq 0)
+    {
+        return [IntPtr]::Zero # CFG not supported on this platform
+    }
+
+    $Offset = [System.Runtime.InteropServices.Marshal]::ReadInt32($LdrControlFlowGuardEnforced.ToInt64() + 3)
+    $pCfgBitMap = $LdrControlFlowGuardEnforced.ToInt64() + 8 + $Offset
+    
+    # Read the value of the CFG BitMap address in our CFG-Enabled PowerShell process
+    $CfgBitMap = [System.Runtime.InteropServices.Marshal]::ReadIntPtr($pCfgBitMap)
+    if($CfgBitMap -eq [IntPtr]::Zero)
+    {
+        Write-Warning "CFG BitMap address not found at 0x$($CfgBitmap.ToString('x'))"
+        return [IntPtr]::Zero
+    }
+    
+    # Validate the CFG BitMap address
+    $CurrentProcess = [IntPtr](-1)
+    $MemoryBasicInfo = VirtualQueryEx -ProcessHandle $CurrentProcess -BaseAddress $CfgBitMap
+    if($MemoryBasicInfo.AllocationBase -ne [UIntPtr]([UInt64]$CfgBitMap.ToInt64()))
+    {
+        Write-Warning "CFG BitMap address not valid at 0x$($CfgBitmap.ToString('x'))"
+        return [IntPtr]::Zero
+    }
+
+    return [IntPtr]$pCfgBitmap
+}
+
+function IsCfgBitMapPrivate
+{
+<#
+.SYNOPSIS
+
+Returns whether the CFG BitMap entry in teh target process for the specified address is private.
+
+.DESCRIPTION
+
+.PARAMETER pCfgBitMap
+
+The address of ntdll!LdrSystemDllInitBlock.CfgBitMap
+
+.PARAMETER ProcessHandle
+
+A read handle to the target process.
+
+.PARAMETER Address
+
+The address to check.
+
+.NOTES
+
+Author - John Uhlmann (@jdu2600)
+
+.LINK
+
+.EXAMPLE
+#>
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [IntPtr]
+        $pCfgBitMap,
+
+        [Parameter(Mandatory = $true)]
+        [IntPtr]
+        $ProcessHandle,
+
+        [Parameter(Mandatory = $true)]
+        [IntPtr]
+        $Address
+
+    )
+
+    # Read the location of the CFG BitMap address in our process
+    $Buffer = ReadProcessMemory -ProcessHandle $hProcess -BaseAddress $pCfgBitmap -Size $([IntPtr]::Size)
+    $CfgBitmap = if ([IntPtr]::Size -eq 8) {[System.BitConverter]::ToInt64($Buffer, 0)} else {[System.BitConverter]::ToInt32($Buffer, 0)}
+    if($CfgBitmap -eq 0)
+    {
+        return $false # CFG is not enabled
+    }
+
+    # Validate the CFG BitMap
+    $MemoryBasicInfo = VirtualQueryEx -ProcessHandle $hProcess -BaseAddress $CfgBitmap
+    if($MemoryBasicInfo.AllocationBase -ne [UIntPtr]([UInt64]$CfgBitmap))
+    {
+        Write-Warning "CFG BitMap address not found at 0x$($CfgBitmap.ToString('x'))"
+        return $false
+    }
+
+    # Find the CFG entry for target address
+    $CfgIndexShift = if ([IntPtr]::Size -eq 8) {9} else {8}
+    $pCfgEntry = $CfgBitmap + ($Address.ToInt64() -shr $CfgIndexShift) * [IntPtr]::Size
+    $MemoryBasicInfo = VirtualQueryEx -ProcessHandle $hProcess -BaseAddress $pCfgEntry
+    if (($MemoryBasicInfo.State -ne $MemState::MEM_COMMIT) -or
+        ($MemoryBasicInfo.Type -ne $MemType::MEM_MAPPED) -or
+        ($MemoryBasicInfo.Protect -eq $MemProtect::PAGE_NOACCESS))
+    {
+        Write-Warning "Invalid CFG Entry for 0x$($Address.ToString('x'))"
+        return $false
+    }
+
+    return (IsWorkingSetPage -ProcessHandle $hProcess -Address $pCfgEntry)
+}
+
+function SuspiciousWrappedThreadStartReturnAddress
+{
+<#
+.SYNOPSIS
+
+Checks the return address into the module that called the given CreateThread wrapper for suspicious characteristics.
+
+.DESCRIPTION
+
+.PARAMETER ProcessHandle
+
+.PARAMETER ThreadHandle
+
+.PARAMETER ModuleRegex
+
+.NOTES
+
+Author - John Uhlmann (@jdu2600)
+
+.LINK
+
+.EXAMPLE
+#>
 
     param
     (
@@ -566,7 +710,6 @@ function SuspiciousWrappedThreadStartReturnAddress {
     }
 
     # 2. The TIB is the first elemenet of the TEB. Read the TIB to determine the stack limits.
-    # TODO(jdu) Urgh. Powershell help needed... there must be a neater way...
     $Buffer = ReadProcessMemory -ProcessHandle $ProcessHandle -BaseAddress $ThreadBasicInfo.TebBaseAddress -Size $TIB64::GetSize()
     $TibPtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($TIB64::GetSize())
     [System.Runtime.InteropServices.Marshal]::Copy($Buffer, 0, $TibPtr, $TIB64::GetSize())
@@ -635,6 +778,9 @@ function SuspiciousWrappedThreadStartReturnAddress {
         $PrivatePage = IsWorkingSetPage -ProcessHandle $hProcess -Address $Rsp
         $Suspicious = $NonImageFound -or $PrivatePage
     }
+
+    [System.Runtime.InteropServices.Marshal]::FreeHGlobal($TibPtr)
+    [System.Runtime.InteropServices.Marshal]::FreeHGlobal($RspBuffer)
 
     Write-Output $Suspicious
 }
@@ -1967,7 +2113,7 @@ function GetTokenInformation
     # initial query to determine the necessary buffer size
     $TokenPtrSize = 0
     $Success = $Advapi32::GetTokenInformation($TokenHandle, $TokenInformationClass, 0, $TokenPtrSize, [ref]$TokenPtrSize)
-    [IntPtr]$TokenPtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($TokenPtrSize)
+    $TokenPtr = [IntPtr]::Zero
     
     if($TokenPtrSize -ne 0)
     {
@@ -2115,7 +2261,10 @@ function NtQueryInformationThread_Win32StartAddress
         Write-Debug "NtQueryInformationThread Error: $(([ComponentModel.Win32Exception] $LastError).Message)"
     }
     
-    Write-Output ([System.Runtime.InteropServices.Marshal]::ReadIntPtr($Buffer))
+    
+    $Win32StartAddress = [System.Runtime.InteropServices.Marshal]::ReadIntPtr($Buffer)
+    [System.Runtime.InteropServices.Marshal]::FreeHGlobal($Buffer)
+    Write-Output $Win32StartAddress
 }
 
 function OpenProcess
@@ -2812,9 +2961,7 @@ function IsWorkingSetPage
         Write-Debug "QueryWorkingSetEx Error: $(([ComponentModel.Win32Exception] $LastError).Message)"
     }
 
-    $IsPrivate = ($WorkingSetInfo.VirtualAttributes.ToInt64() -band $WORKING_SET_EX_BLOCK::Valid) -eq $WORKING_SET_EX_BLOCK::Valid -and
-    ($WorkingSetInfo.VirtualAttributes.ToInt64() -band $WORKING_SET_EX_BLOCK::Shared) -ne $WORKING_SET_EX_BLOCK::Shared
-    Write-Output $IsPrivate
+    Write-Output (($WorkingSetInfo.VirtualAttributes.ToInt64() -band $WORKING_SET_EX_BLOCK::Shared) -ne $WORKING_SET_EX_BLOCK::Shared)
 }
 
 function GetProcAddress
