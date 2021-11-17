@@ -94,9 +94,11 @@ function Get-InjectedThreadEx
     $NtdllThreads64 = @()
     # [1] ntdll!RtlpQueryProcessDebugInformationRemote is exported - look it up.
     $NtdllThreads64 += GetProcAddress -ModuleName "ntdll.dll" -ProcName "RtlpQueryProcessDebugInformationRemote"
+    # [2] ntdll!DbgUiRemoteBreakin is exported - look it up.
+    $NtdllThreads64 += GetProcAddress -ModuleName "ntdll.dll" -ProcName "DbgUiRemoteBreakin"
     # For the non-exported entry points, we check the Win32StartAddress of threads we trust.
-    # [2] ntdll!TppWorkerThread is already used by PowerShell :-)
-    # [3] ntdll!EtwpLogger is not exported, but is spawned in processes that use a Private ETW Logging Session
+    # [3] ntdll!TppWorkerThread is already used by PowerShell :-)
+    # [4] ntdll!EtwpLogger is not exported, but is spawned in processes that use a Private ETW Logging Session
     # https://docs.microsoft.com/en-us/windows/win32/etw/configuring-and-starting-a-private-logger-session
     # Note - the PowerShell ETW CmdLets don't fully support private sessions.
     # This means that we need to need start it asynchronously (-AsJob) or wait for a timeout.
@@ -123,7 +125,7 @@ function Get-InjectedThreadEx
             $NtdllThreads64 += $Win32StartAddress
         }
     }
-    if($NtdllThreads64.Length -ne 3)
+    if($NtdllThreads64.Length -ne 4)
     {
         Write-Warning "Failed to enumerate all valid ntdll thread start addresses."
     }
@@ -421,7 +423,7 @@ function Get-InjectedThreadEx
                 }
 
                 # kernel32!LoadLibrary
-                # There are no valid thread entry points in kernel32.
+                # There are no valid thread entry points in kernel32 that I know of.
                 $Kernel32Regex = '^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\kernel(32|base)\.dll$'
                 if ($StartAddressModule -match $Kernel32Regex)
                 {
@@ -431,10 +433,11 @@ function Get-InjectedThreadEx
                 # ntdll.dll but not -
                 #  * ntdll!TppWorkerThread
                 #  * ntdll!EtwpLogger
+                #  * ntdll!DebUiRemoteBreakin
                 #  * ntdll!RtlpQueryProcessDebugInformationRemote
-                # These are the only valid thread entry points in ntdll.
+                # These are the only valid thread entry points in ntdll that I know of.
                 if ((-not $IsWow64Process) -and
-                    ($NtdllThreads64.Length -eq 3) -and
+                    ($NtdllThreads64.Length -eq 4) -and
                     ($StartAddressModule -match $NtdllRegex) -and
                     ($NtdllThreads64 -notcontains $Win32StartAddress))
                 {
