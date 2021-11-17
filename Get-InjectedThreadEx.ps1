@@ -172,7 +172,7 @@ function Get-InjectedThreadEx
         # Now loop over this process's threads
         foreach ($thread in $Process.Threads)
         {
-            $hThread = OpenThread -ThreadId $thread.Id -DesiredAccess THREAD_ALL_ACCESS
+            $hThread = OpenThread -ThreadId $Thread.Id -DesiredAccess THREAD_ALL_ACCESS
             if ($hThread -eq 0)
             {
                 continue # skip thread - Access is Denied
@@ -197,11 +197,11 @@ function Get-InjectedThreadEx
                 }
                 $AuthenticodeSignature = $AuthenticodeSignatures[$StartAddressModule]
                 $StartAddressModuleSigned = $AuthenticodeSignature.Status -eq 'Valid'
-                Write-Verbose -Message " * Thread Id: [$($thread.Id)] $($StartAddressModule) signed:$($StartAddressModuleSigned)"
+                Write-Verbose -Message " * Thread Id: [$($Thread.Id)] $($StartAddressModule) signed:$($StartAddressModuleSigned)"
             }
             else
             {
-                Write-Verbose -Message " * Thread Id: [$($thread.Id)] $($MemoryType)"
+                Write-Verbose -Message " * Thread Id: [$($Thread.Id)] $($MemoryType)"
             }
 
             # check if thread has unique token
@@ -226,6 +226,25 @@ function Get-InjectedThreadEx
             }
             catch {}
 
+            $Detections = @()
+            #################################################################################################
+            # Suspicious thread heuristics
+            #################################################################################################
+            # original
+            #  - not MEM_IMAGE
+            # new
+            #  - MEM_IMAGE and x64 and Win32StartAddress is unexpected prolog
+            #  - MEM_IMAGE and Win32StartAddress is on a private (modified) page
+            #  - MEM_IMAGE and dll and Win32StartAddress entry in CFG BitMap is on a private (modified) page
+            #  - MEM_IMAGE and Win32StartAddress is in a suspicious module
+            #  - MEM_IMAGE and dll and Win32StartAddress is exported (-Aggressive only)
+            #  - MEM_IMAGE and Win32StartAddress is preceded by unexpected byte (-Aggressive only)
+            #  - MEM_IMAGE and x64 and Win32StartAddress is not 16-byte aligned (-Aggressive only)
+            #  - Thread has a higher integrity level than process
+            #  - Thread has additional unexpected privileges
+            #  - Thread is sleeping (enrichment only)
+            #################################################################################################
+
             if ($MemoryState -eq $MemState::MEM_COMMIT)
             {
                 $StartBytesLength = [math]::Min(48, [UInt64]$MemoryBasicInfo.BaseAddress + [UInt64]$MemoryBasicInfo.RegionSize - [Int64]$Win32StartAddress)
@@ -240,19 +259,8 @@ function Get-InjectedThreadEx
                 ForEach ($Byte in $Buffer) { $TailBytes.AppendFormat("{0:x2}", $Byte) | Out-Null }
                 $TailBytes = $TailBytes.ToString()
 
-                # Suspicious thread heuristics
-                # original
-                #  - not MEM_IMAGE
-                # new
-                #  - MEM_IMAGE and x64 and Win32StartAddress is unexpected prolog
-                #  - MEM_IMAGE and Win32StartAddress is on a private (modified) page
-                #  - MEM_IMAGE and dll and Win32StartAddress entry in CFG BitMap is on a private (modified) page
-                #  - MEM_IMAGE and Win32StartAddress is in a suspicious module
-                #  - MEM_IMAGE and Win32StartAddress is preceded by unexpected byte (-Aggressive only)
-                #  - MEM_IMAGE and x64 and Win32StartAddress is not 16-byte aligned (-Aggressive only)
-                #  - Thread has a higher integrity level than process
-                #  - Thread has additional unexpected privileges
-                $Detections = @()
+                
+                
 
                 # All threads not starting in a MEM_IMAGE region are suspicious
                 if ($MemoryType -ne $MemType::MEM_IMAGE)
@@ -470,6 +478,13 @@ function Get-InjectedThreadEx
                     }
                 }
 
+                # Definitely not a smoking gun on its own, but obfuscate-and-sleep approaches are becoming popular.
+                if(($Detections.Length -ne 0) -and
+                   ($Thread.WaitReason.ToString() -eq 'ExecutionDelay'))
+                {
+                    $Detections += "sleep"
+                }
+
                 if ($Detections.Length -ne 0)
                 {
                     $ThreadDetail = New-Object PSObject
@@ -488,9 +503,10 @@ function Get-InjectedThreadEx
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessLogonSessionStartTime -Value $ProcessLogonSession.StartTime
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessLogonType -Value $ProcessLogonSession.LogonType
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessAuthenticationPackage -Value $ProcessLogonSession.AuthenticationPackage
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name ThreadId -Value $thread.Id
-                    $ThreadDetail | Add-Member -MemberType NoteProperty -Name ThreadStartTime -Value $thread.StartTime
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name BasePriority -Value $thread.BasePriority
+                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name ThreadId -Value $Thread.Id
+                    $ThreadDetail | Add-Member -MemberType NoteProperty -Name ThreadStartTime -Value $Thread.StartTime
+                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name BasePriority -Value $Thread.BasePriority
+                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name WaitReason -Value $Thread.WaitReason
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name IsUniqueThreadToken -Value $IsUniqueThreadToken
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name ThreadIntegrity -Value $ThreadIntegrity
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name ThreadPrivilege -Value $ThreadPrivs
