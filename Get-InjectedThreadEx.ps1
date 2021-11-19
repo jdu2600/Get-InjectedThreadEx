@@ -74,7 +74,10 @@ function Get-InjectedThreadEx
     param
     (
         [Parameter()]
-        [Switch]$Aggressive
+        [Switch]$Aggressive,
+
+        [Parameter()]
+        [Switch]$Brief
     )
 
     if(![Environment]::Is64BitProcess)
@@ -501,44 +504,50 @@ function Get-InjectedThreadEx
                     $ThreadDetail = New-Object PSObject
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessName -Value $WmiProcess.Name
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessId -Value $WmiProcess.ProcessId
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name Wow64 -Value $IsWow64Process
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name Path -Value $WmiProcess.Path
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name KernelPath -Value $ProcessKernelPath
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name CommandLine -Value $WmiProcess.CommandLine
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name PathMismatch -Value $PathMismatch
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessIntegrity -Value $ProcessIntegrity
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessPrivilege -Value $ProcessPrivs
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessLogonId -Value $ProcessLogonSession.LogonId
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessSecurityIdentifier -Value $ProcessSID
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessUserName -Value "$($ProcessLogonSession.Domain)\$($ProcessLogonSession.UserName)"
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessLogonSessionStartTime -Value $ProcessLogonSession.StartTime
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessLogonType -Value $ProcessLogonSession.LogonType
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessAuthenticationPackage -Value $ProcessLogonSession.AuthenticationPackage
+                    if (-not $Brief)
+                    {
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name Wow64 -Value $IsWow64Process
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name Path -Value $WmiProcess.Path
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name KernelPath -Value $ProcessKernelPath
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name CommandLine -Value $WmiProcess.CommandLine
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name PathMismatch -Value $PathMismatch
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessIntegrity -Value $ProcessIntegrity
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessPrivilege -Value $ProcessPrivs
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessLogonId -Value $ProcessLogonSession.LogonId
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessSecurityIdentifier -Value $ProcessSID
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessUserName -Value "$($ProcessLogonSession.Domain)\$($ProcessLogonSession.UserName)"
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessLogonSessionStartTime -Value $ProcessLogonSession.StartTime
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessLogonType -Value $ProcessLogonSession.LogonType
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name ProcessAuthenticationPackage -Value $ProcessLogonSession.AuthenticationPackage
+                    }
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name ThreadId -Value $Thread.Id
-                    $ThreadDetail | Add-Member -MemberType NoteProperty -Name ThreadStartTime -Value $Thread.StartTime
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name BasePriority -Value $Thread.BasePriority
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name WaitReason -Value $Thread.WaitReason
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name IsUniqueThreadToken -Value $IsUniqueThreadToken
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name ThreadIntegrity -Value $ThreadIntegrity
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name ThreadPrivilege -Value $ThreadPrivs
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name AdditionalThreadPrivilege -Value $NewPrivileges
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name ThreadLogonId -Value $ThreadLogonSession.LogonId
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name ThreadSecurityIdentifier -Value $ThreadSID
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name ThreadUserName -Value "$($ThreadLogonSession.Domain)\$($ThreadLogonSession.UserName)"
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name ThreadLogonSessionStartTime -Value $ThreadLogonSession.StartTime
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name ThreadLogonType -Value $ThreadLogonSession.LogonType
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name ThreadAuthenticationPackage -Value $ThreadLogonSession.AuthenticationPackage
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name AllocatedMemoryProtection -Value $AllocatedMemoryProtection
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name MemoryProtection -Value $MemoryProtection
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name MemoryState -Value $MemoryState
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name MemoryType -Value $MemoryType
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddress -Value $Win32StartAddress.ToString('x')
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddressModule -Value $StartAddressModule
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddressModuleSigned -Value $StartAddressModuleSigned
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddressPrivate -Value $PrivatePage
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name Size -Value $MemoryBasicInfo.RegionSize
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name TailBytes -Value $TailBytes
-                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name StartBytes -Value $StartBytes
+                    if (-not $Brief)
+                    {
+                        $ThreadDetail | Add-Member -MemberType NoteProperty -Name ThreadStartTime -Value $Thread.StartTime
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name BasePriority -Value $Thread.BasePriority
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name WaitReason -Value $Thread.WaitReason
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name IsUniqueThreadToken -Value $IsUniqueThreadToken
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name ThreadIntegrity -Value $ThreadIntegrity
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name ThreadPrivilege -Value $ThreadPrivs
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name AdditionalThreadPrivilege -Value $NewPrivileges
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name ThreadLogonId -Value $ThreadLogonSession.LogonId
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name ThreadSecurityIdentifier -Value $ThreadSID
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name ThreadUserName -Value "$($ThreadLogonSession.Domain)\$($ThreadLogonSession.UserName)"
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name ThreadLogonSessionStartTime -Value $ThreadLogonSession.StartTime
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name ThreadLogonType -Value $ThreadLogonSession.LogonType
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name ThreadAuthenticationPackage -Value $ThreadLogonSession.AuthenticationPackage
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name AllocatedMemoryProtection -Value $AllocatedMemoryProtection
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name MemoryProtection -Value $MemoryProtection
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name MemoryState -Value $MemoryState
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name MemoryType -Value $MemoryType
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddress -Value $Win32StartAddress.ToString('x')
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddressModule -Value $StartAddressModule
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddressModuleSigned -Value $StartAddressModuleSigned
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddressPrivate -Value $PrivatePage
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name Size -Value $MemoryBasicInfo.RegionSize
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name TailBytes -Value $TailBytes
+                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name StartBytes -Value $StartBytes
+                    }
                     $ThreadDetail | Add-Member -MemberType Noteproperty -Name Detections -Value $Detections
                     Write-Output $ThreadDetail
                 }
