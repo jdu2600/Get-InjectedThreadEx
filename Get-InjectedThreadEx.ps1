@@ -386,14 +386,27 @@ function Get-InjectedThreadEx
                     $Detections += (CallStackDetections -ProcessHandle $hProcess -ThreadHandle $hThread -StartAddressModule $StartAddressModule -Aggressive $Aggressive)
                 }
 
-                # kernel32!LoadLibrary
-                # There are no valid thread entry points in kernel32 that I know of.
-                $Kernel32Regex = '^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\kernel(32|base)\.dll$'
-                if ($StartAddressModule -match $Kernel32Regex)
+                
+                # There are no valid thread entry points (that I know of) in many Win32 modules.
+                $ModulesWithoutThreadEntries = @(
+                    ('^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\kernel32\.dll$', 'kernel32'),
+                    ('^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\kernelbase\.dll$', 'kernelbase'),
+                    ('^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\user32\.dll$', 'user32'),
+                    ('^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\shell32\.dll$', 'shell32'),
+                    ('^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\advapi32\.dll$', 'advapi32')
+                    # ... and more
+                );
+                foreach ($Module in $ModulesWithoutThreadEntries)
                 {
-                    $Detections += 'kernel32'
+                    if ($StartAddressModule -match $Module[0])
+                    {
+                        $Detections += $Module[1]
+                        break
+                    }
                 }
-                # And, even if there are, LoadLibrary is always a suspicious start address.
+
+                # kernel32!LoadLibrary
+                # And, even if there are, LoadLibrary is always a suspicious start address.               
                 if ($LoadLibrary -contains $Win32StartAddress)
                 {
                     $Detections += 'LoadLibrary'
