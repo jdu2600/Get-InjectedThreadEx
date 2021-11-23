@@ -17,6 +17,18 @@ function Get-InjectedThreadEx
 
     NOTE: Nothing in security is a silver bullet. An attacker could modify their tactics to avoid detection using this methodology.
     
+    .PARAMETER Aggressive
+    Enables additional scans that have higher false positive rates.
+
+    .PARAMETER Faster
+    Disables slower scans that typically overlap with other detections.
+
+    .PARAMETER ProcessId
+    Only scans the specified pid.
+
+    .PARAMETER Brief
+    Limits output to process name, pid, tid, Win32StartAddress module and detections only.
+
     .NOTES
 
     Authors - Jared Atkinson (@jaredcatkinson)
@@ -77,7 +89,13 @@ function Get-InjectedThreadEx
         [Switch]$Aggressive,
 
         [Parameter()]
-        [Switch]$Brief
+        [Switch]$Brief,
+
+        [Parameter()]
+        [Switch]$Faster,
+
+        [Parameter()]
+        [UInt32]$ProcessId
     )
 
     if(![Environment]::Is64BitProcess)
@@ -109,7 +127,8 @@ function Get-InjectedThreadEx
     try
     {
         $EVENT_TRACE_PRIVATE_LOGGER_MODE = 0x800
-        $Job = New-EtwTraceSession -Name GetInjectedThreadEx -LogFileMode $EVENT_TRACE_PRIVATE_LOGGER_MODE -LocalFilePath "$($ENV:Temp)\GetInjectedThreadEx-tmp.etl" -AsJob
+        $Random = [System.IO.Path]::GetRandomFileName()
+        $Job = New-EtwTraceSession -Name "GetInjectedThreadEx_$($Random)" -LogFileMode $EVENT_TRACE_PRIVATE_LOGGER_MODE -LocalFilePath "$($ENV:Temp)\GetInjectedThreadEx-$($Random).etl" -AsJob
         Start-Sleep -Milliseconds 500
     }
     catch
@@ -133,8 +152,13 @@ function Get-InjectedThreadEx
         Write-Warning "Failed to enumerate all valid ntdll thread start addresses."
     }
 
+    $LoadLibrary = @()
+    $LoadLibrary += GetProcAddress -ModuleName "kernel32.dll" -ProcName "LoadLibraryA"
+    $LoadLibrary += GetProcAddress -ModuleName "kernel32.dll" -ProcName "LoadLibraryW"
+
     # Now enumerate all threads for all processes and check for injection characteristics
-    foreach($Process in (Get-Process))
+    $Processes = if($ProcessId) { Get-Process -Id $ProcessId } else {Get-Process}
+    foreach($Process in $Processes)
     {
         if($Process.Id -eq 0 -or $Process.Id -eq 4)
         {
@@ -242,6 +266,7 @@ function Get-InjectedThreadEx
             #  - MEM_IMAGE and Win32StartAddress is on a private (modified) page
             #  - MEM_IMAGE and dll and Win32StartAddress entry in CFG BitMap is on a private (modified) page
             #  - MEM_IMAGE and Win32StartAddress is in a suspicious module
+            #  - MEM_IMAGE and Win32StartAddress is missing from call stack
             #  - MEM_IMAGE and dll and Win32StartAddress is CFG suppressed export (-Aggressive only)
             #  - MEM_IMAGE and Win32StartAddress is preceded by unexpected byte (-Aggressive only)
             #  - MEM_IMAGE and x64 and Win32StartAddress is not 16-byte aligned (-Aggressive only)
@@ -264,8 +289,6 @@ function Get-InjectedThreadEx
                 ForEach ($Byte in $Buffer) { $TailBytes.AppendFormat("{0:x2}", $Byte) | Out-Null }
                 $TailBytes = $TailBytes.ToString()
 
-                
-                
 
                 # All threads not starting in a MEM_IMAGE region are suspicious
                 if ($MemoryType -ne $MemType::MEM_IMAGE)
@@ -273,40 +296,7 @@ function Get-InjectedThreadEx
                     $Detections += $MemoryType
                 }
 
-                # Modern CPUs load instructions in 16-byte lines. So, for performance, compilers may want to
-                # ensure that the maximum number of useful bytes will be loaded. This is either 16 or the
-                # number of bytes modulo 16 until the end of the first call (or absolute jmp) instruction.
-                #
-                # Any start address not aligned as such is a potential MEM_IMAGE trampoline gadget such
-                # as 'jmp rcx'
-                # https://blog.xpnsec.com/undersanding-and-evading-get-injectedthread/
-                #
-                # In practice, this has a high FP rate - so don't check by default.
-                $EarlyCallRegex = '^(..)*?(e8|ff15)'
-                $ImmediateJumpRegex = '^(e9|(48)?ff25)'
-                if ($Aggressive -and
-                    (([Int64]$Win32StartAddress -band 0xF) -ne 0) -and
-                    # If < Windows 10 then also allow 4-byte alignments
-                    (($WindowsVersion -ge 10) -or (([Int64]$Win32StartAddress -band 3) -ne 0)))
-                {
-                    if ($StartBytes -match $EarlyCallRegex)
-                    {
-                        # Calulate the distance to the end of the call modulo 16
-                        # This calculation isn't perfect - we did a rough regex match, not an exact decompilation...
-                        $BytesNeeded = (($matches[0].Length / 2) -band 0xF) + 4
-                        $BytesLoaded = 16 - ([Int64]$Win32StartAddress -band 0xF)
-                        if ($BytesLoaded -lt $BytesNeeded)
-                        {
-                            $Detections += 'alignment'
-                        }
-                    }
-                    elseif ($StartBytes -notmatch $ImmediateJumpRegex)
-                    {
-                        $Detections += 'alignment'
-                    }
-                }
-                        
-                # Any x64 threads not starting with a valid Windows x64 ABI prolog are suspicious
+                # Any x64 threads not starting with a valid Windows x64 prolog are suspicious
                 # In lieu of a dissassembler in PowerShell we approximate with a regex :-(
                 $x64PrologRegex = '^(' +
                 '(488d0[5d]........)?' +             # lea rax,[rip+nnnn]
@@ -347,16 +337,6 @@ function Get-InjectedThreadEx
                     $Detections += 'prolog'
                 }
 
-                # The byte preceding a function prolog is typically a return, or filler byte.
-                # False positives can occur if data was included in a code section. This was
-                # common in older compilers.
-                # In practice, this has a medium FP rate - so don't check by default.
-                $x64EpilogFillerRegex = '(00|90|c3|cc|(e8|e9|ff25)........|^)$'
-                if ($Aggressive -and ($TailBytes -notmatch $x64EpilogFillerRegex))
-                {
-                    $Detections += 'tail'
-                }
-
                 # Has our MEM_IMAGE Win32StartAddress been (naively) hooked?
                 # https://blog.redbluepurple.io/offensive-research/bypassing-injection-detection#creating-the-thread
                 # Note - checking against bytes on disk after the fact won't help with false positives
@@ -371,13 +351,14 @@ function Get-InjectedThreadEx
                 }
 
                 # Has the CFG BitMap entry for Win32StartAddress been modifed post load? e.g. SetProcessValidCallTargets
-                # Note - exe BitMap entries are not shared, only dll BitMap entries (or maybe only KnownDll dlls?).
-                if (([IntPtr]::Zero -ne $CfgBitMapAddress) -and
+                # Note - exe BitMap entries are not shared, only dll BitMap entries.
+                if ((-not $IsWow64Process) -and
+                    ([IntPtr]::Zero -ne $CfgBitMapAddress) -and
                     ($MemoryType -eq $MemType::MEM_IMAGE) -and
                     ($StartAddressModule -notmatch '\.exe$') -and
                     (IsCfgBitMapPrivate -pCfgBitMap $CfgBitMapAddress -ProcessHandle $hProcess -Address $Win32StartAddress))
                 {
-                    $Detections += 'cfg_modifed'
+                    $Detections += 'cfg_modified'
                 }
 
                 # Is this address marked as 'export suppressed' in the CFG BitMap?
@@ -391,46 +372,18 @@ function Get-InjectedThreadEx
                 ### Suspicious start modules
 
                 # unsigned module in signed process - e.g. dll sideloading
-                if($WindowsVersion -ge 10 -and $ProcessModuleSigned -and -not $StartAddressModuleSigned)
+                if ($WindowsVersion -ge 10 -and $ProcessModuleSigned -and -not $StartAddressModuleSigned)
                 {
                     $Detections += 'unsigned'
                 }
 
-                # crt!_startthread[ex] - the CRT wrapper around CreateThread
                 # https://www.trustedsec.com/blog/avoiding-get-injectedthread-for-internal-thread-creation/
-                $CrtRegex = '^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\(msvcr[t0-9]+|ucrtbase)d?\.dll$'
-                # https://docs.microsoft.com/en-us/cpp/c-runtime-library/reference/beginthread-beginthreadex
-                # This will *false positive* on legitimate CRT applications...
-                # If we were in a kernel CreateThreadNotifyRoutine then we could inspect the function's
-                # parameter to determine the real Win32StartAddress.
-                # Instead we walk the thread's stack bottom up to find an approximate Win32StartAddress
-                # so we can eliminate the FPs.
-                if ($StartAddressModule -match $CrtRegex)
+                $WrapperRegex = '^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\((msvcr[t0-9]+|ucrtbase)d?|SHCore|Shlwapi)\.dll$'
+                if ((-not $IsWow64Process) -and                   # TODO(jdu) Wow64 support not implemented
+                    ((-not $Faster) -or                             # This check is expensive.
+                    ($StartAddressModule -match $WrapperRegex)))  # Always perform if a known wrapper module.
                 {
-                    if (-not $IsWow64Process)
-                    {
-                        $Suspicious = SuspiciousWrappedThreadStartReturnAddress -ProcessHandle $hProcess -ThreadHandle $hThread -ModuleRegex $CrtRegex
-                        if ($Suspicious)
-                        {
-                            $Detections += 'crt'
-                        }
-                    }
-                    # TODO(jdu) Handle x86 FPs...
-                }
-
-                # SHCore!_WrapperThreadProc - the Shell32 wrapper around CreateThread
-                $SHCoreRegex = '^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\(SHCore|Shlwapi).dll$'
-                if ($StartAddressModule -match $SHCoreRegex)
-                {
-                    if (-not $IsWow64Process)
-                    {
-                        $Suspicious = SuspiciousWrappedThreadStartReturnAddress -ProcessHandle $hProcess -ThreadHandle $hThread -ModuleRegex $SHCoreRegex
-                        if ($Suspicious)
-                        {
-                            $Detections += 'shell32'
-                        }
-                    }
-                    # TODO(jdu) Handle x86 FPs...
+                    $Detections += (CallStackDetections -ProcessHandle $hProcess -ThreadHandle $hThread -StartAddressModule $StartAddressModule -Aggressive $Aggressive)
                 }
 
                 # kernel32!LoadLibrary
@@ -439,6 +392,11 @@ function Get-InjectedThreadEx
                 if ($StartAddressModule -match $Kernel32Regex)
                 {
                     $Detections += 'kernel32'
+                }
+                # And, even if there are, LoadLibrary is always a suspicious start address.
+                if ($LoadLibrary -contains $Win32StartAddress)
+                {
+                    $Detections += 'LoadLibrary'
                 }
 
                 # ntdll.dll but not -
@@ -492,9 +450,54 @@ function Get-InjectedThreadEx
                     }
                 }
 
+                # The byte preceding a function prolog is typically a return, or filler byte.
+                # False positives can occur if data was included in a code section. This was
+                # common in older compilers.
+                # In practice, this has a medium FP rate - so don't check by default.
+                $x64EpilogFillerRegex = '(00|90|c3|cc|(e8|e9|ff25)........|^)$'
+                if (($Aggressive -or ($Detections.Length -ne 0)) -and
+                    ($TailBytes -notmatch $x64EpilogFillerRegex))
+                {
+                    $Detections += 'tail'
+                }
+
+                # Modern CPUs load instructions in 16-byte lines. So, for performance, compilers may want to
+                # ensure that the maximum number of useful bytes will be loaded. This is either 16 or the
+                # number of bytes modulo 16 until the end of the first call (or absolute jmp) instruction.
+                #
+                # Any start address not aligned as such is a potential MEM_IMAGE trampoline gadget such
+                # as 'jmp rcx'
+                # https://blog.xpnsec.com/undersanding-and-evading-get-injectedthread/
+                #
+                # In practice, this has a high FP rate - so don't check by default.
+                $EarlyCallRegex = '^(..)*?(e8|ff15)'
+                $ImmediateJumpRegex = '^(e9|(48)?ff25)'
+                if (($Aggressive -or ($Detections.Length -ne 0)) -and
+                    (([Int64]$Win32StartAddress -band 0xF) -ne 0) -and
+                    # If < Windows 10 then also allow 4-byte alignments
+                    (($WindowsVersion -ge 10) -or (([Int64]$Win32StartAddress -band 3) -ne 0)))
+                {
+                    if ($StartBytes -match $EarlyCallRegex)
+                    {
+                        # Calulate the distance to the end of the call modulo 16
+                        # This calculation isn't perfect - we did a rough regex match, not an exact decompilation...
+                        $BytesNeeded = (($matches[0].Length / 2) -band 0xF) + 4
+                        $BytesLoaded = 16 - ([Int64]$Win32StartAddress -band 0xF)
+                        if ($BytesLoaded -lt $BytesNeeded)
+                        {
+                            $Detections += 'alignment'
+                        }
+                    }
+                    elseif ($StartBytes -notmatch $ImmediateJumpRegex)
+                    {
+                        $Detections += 'alignment'
+                    }
+                }
+
                 # Definitely not a smoking gun on its own, but obfuscate-and-sleep approaches are becoming popular.
-                if(($Detections.Length -ne 0) -and
-                   ($Thread.WaitReason.ToString() -eq 'ExecutionDelay'))
+                if (($Detections.Length -ne 0) -and 
+                    ($Thread.WaitReason -ne $null) -and
+                    ($Thread.WaitReason.ToString() -eq 'ExecutionDelay'))
                 {
                     $Detections += "sleep"
                 }
@@ -541,7 +544,10 @@ function Get-InjectedThreadEx
                         $ThreadDetail | Add-Member -MemberType Noteproperty -Name MemoryState -Value $MemoryState
                         $ThreadDetail | Add-Member -MemberType Noteproperty -Name MemoryType -Value $MemoryType
                         $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddress -Value $Win32StartAddress.ToString('x')
-                        $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddressModule -Value $StartAddressModule
+                    }
+                    $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddressModule -Value $StartAddressModule
+                    if (-not $Brief)
+                    {
                         $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddressModuleSigned -Value $StartAddressModuleSigned
                         $ThreadDetail | Add-Member -MemberType Noteproperty -Name Win32StartAddressPrivate -Value $PrivatePage
                         $ThreadDetail | Add-Member -MemberType Noteproperty -Name Size -Value $MemoryBasicInfo.RegionSize
@@ -773,12 +779,12 @@ Author - John Uhlmann (@jdu2600)
     return $BitPair -eq 2 # this range contains an export-suppressed target
 }
 
-function SuspiciousWrappedThreadStartReturnAddress
+function CallStackDetections
 {
 <#
 .SYNOPSIS
 
-Checks the return address into the module that called the given CreateThread wrapper for suspicious characteristics.
+Checks the bottom of the thread's stack for suspicious return addresses.
 
 .DESCRIPTION
 
@@ -786,7 +792,9 @@ Checks the return address into the module that called the given CreateThread wra
 
 .PARAMETER ThreadHandle
 
-.PARAMETER ModuleRegex
+.PARAMETER StartAddressModule
+
+.PARAMETER Aggressive
 
 .NOTES
 
@@ -809,8 +817,11 @@ Author - John Uhlmann (@jdu2600)
 
         [Parameter(Mandatory = $true)]
         [String]
-        $ModuleRegex
+        $StartAddressModule,
 
+        [Parameter(Mandatory = $true)]
+        [Boolean]
+        $Aggressive
     )
 
     <#
@@ -823,7 +834,9 @@ Author - John Uhlmann (@jdu2600)
     ))
     #>
 
-    # TODO(jdu) handle 32-bit ...
+    $WrapperRegex = '^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\((msvcr[t0-9]+|ucrtbase)d?|SHCore|Shlwapi)\.dll$'
+
+    # TODO(jdu) Handle 32-bit thread stacks...
 
     # 1. Query the THREAD_BASIC_INFORMATION to determine the location of the Thread Environment Block (TEB)
     $ThreadBasicInfo = [Activator]::CreateInstance($THREAD_BASIC_INFORMATION)
@@ -834,6 +847,11 @@ Author - John Uhlmann (@jdu2600)
         throw "NtQueryInformationThread Error: $(([ComponentModel.Win32Exception] $LastError).Message)"
     }
 
+    if($ThreadBasicInfo.TebBaseAddress -eq 0)
+    {
+        return
+    }
+
     # 2. The TIB is the first elemenet of the TEB. Read the TIB to determine the stack limits.
     $Buffer = ReadProcessMemory -ProcessHandle $ProcessHandle -BaseAddress $ThreadBasicInfo.TebBaseAddress -Size $TIB64::GetSize()
     $TibPtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($TIB64::GetSize())
@@ -841,20 +859,19 @@ Author - John Uhlmann (@jdu2600)
     $Tib = $TibPtr -as $TIB64
 
     # 3. Read the (partial) stack contents
-    $StackReadLength = [math]::Min(0x3000, [Int64]$Tib.StackBase - [Int64]$Tib.StackLimit)
+    $StackReadLength = [math]::Min(0x2000, [Int64]$Tib.StackBase - [Int64]$Tib.StackLimit)
     $StackBuffer = ReadProcessMemory -ProcessHandle $ProcessHandle -BaseAddress ([Int64]$Tib.StackBase - $StackReadLength) -Size $StackReadLength
 
-    # 4. Search the stack bottom up for the return address immediately after the wrapper.
-    # ntdll!RtlUserThreadStart -> kernel32!BaseThreadInitThunk -> <wrapper> -> actual user start address
+    # 4. Search the stack bottom up for the (probable) initial return addresses of the first 5 frames.
+    # [expected] ntdll!RtlUserThreadStart -> kernel32!BaseThreadInitThunk -> Win32StartAddress
+    # Note - at this stack depth it is unlikely, but not impossible, that we encounter a false positive return address on the stack.
     $RspBuffer = [System.Runtime.InteropServices.Marshal]::AllocHGlobal([IntPtr]::Size)
-    $Rsp = 0
-    $NtdllFound = $false
-    $Kernel32Found = $false
-    $WrapperFound = $false
-    $NonImageFound = $false
-    $NtdllRegex = '^[A-Z]:\\Windows\\System32\\ntdll\.dll$'
-    $Kernel32Regex = '^[A-Z]:\\Windows\\System32\\kernel32\.dll$'
-    for ($i = 8; $Rsp -eq 0 -and $i -lt $StackReadLength; $i += 16)
+    $Detections = @()
+    $Unbacked = $false
+    $ReturnModules = @()
+    # x64 stack frames are 16-byte aligned
+    $MaxFrameCount = 5
+    for ($i = 8; ($ReturnModules.Count -lt $MaxFrameCount) -and ($i -lt $StackReadLength); $i += 16)
     {
         [System.Runtime.InteropServices.Marshal]::Copy($StackBuffer, ($StackReadLength - $i), $RspBuffer, [IntPtr]::Size)
         $CandidateRsp = [System.Runtime.InteropServices.Marshal]::ReadInt64($RspBuffer)
@@ -867,47 +884,72 @@ Author - John Uhlmann (@jdu2600)
                     $MemoryBasicInfo.Protect -eq $MemProtection::PAGE_EXECUTE_READWRITE -or
                     $MemoryBasicInfo.Protect -eq $MemProtection::PAGE_EXECUTE_WRITECOPY))
             {
-                # 5. Is this the 4th return address on the stack?
-                # Note - at this stack depth it is unlikely, but not impossible, that we encounter a
-                # false positive return address on the stack.
-                $NonImageFound = $NonImageFound -or ($MemoryBasicInfo.Type -ne $MemType::MEM_IMAGE)
-                if($MemoryBasicInfo.Type -eq $MemType::MEM_IMAGE)
+                if ($MemoryBasicInfo.Type -eq $MemType::MEM_IMAGE)
                 {
                     $CandidateRspModule = GetMappedFileName -ProcessHandle $hProcess -Address $CandidateRsp
+                    if($CandidateRspModule -eq $StartAddressModule)
+                    {
+                        # StartAddressModule found - stop searching (or after next frame)
+                        $MaxFrameCount = if($Aggressive -or ($StartAddressModule -match $WrapperRegex)) {[math]::Min($MaxFrameCount, $ReturnModules.Count + 2)} else {$ReturnModules.Count}
+                    }
+                    elseif(IsWorkingSetPage -ProcessHandle $hProcess -Address $CandidateRsp)
+                    {
+                        $Detections += "hooked(" + [System.IO.Path]::GetFileNameWithoutExtension($CandidateRspModule) + ")"
+                    }
                 }
                 else
                 {
                     $CandidateRspModule = $MemoryBasicInfo.Type -as $MemType
+                    $Unbacked = $true
+                    # Unbacked found - stop searching after next frame
+                    $MaxFrameCount = [math]::Min($MaxFrameCount, $ReturnModules.Count + 2)
                 }
 
                 Write-Verbose -Message "  * Stack +0x$($i.ToString('x')): $($CandidateRspModule)"
 
-                if ($WrapperFound -and ($CandidateRspModule -notmatch $ModuleRegex))
+                if (($ReturnModules.Count -eq 0) -or ($ReturnModules[$ReturnModules.Count-1] -ne $CandidateRspModule))
                 {
-                    $Rsp = $CandidateRsp
-                }
-                else
-                {
-                    $NtdllFound = $NtdllFound -or ($CandidateRspModule -match $NtdllRegex)
-                    $Kernel32Found = $Kernel32Found -or ($NtdllFound -and ($CandidateRspModule -match $Kernel32Regex))
-                    $WrapperFound = $WrapperFound -or ($Kernel32Found -and ($CandidateRspModule -match $ModuleRegex))
+                    $ReturnModules +=  $CandidateRspModule;
                 }
             }
         }
     }
-
-    # 6. Is our return address either not MEM_IMAGE or modified MEM_IMAGE?
-    $Suspicious = $false
-    if ($Rsp -ne 0)
-    {
-        $PrivatePage = IsWorkingSetPage -ProcessHandle $hProcess -Address $Rsp
-        $Suspicious = $NonImageFound -or $PrivatePage
-    }
-
     [System.Runtime.InteropServices.Marshal]::FreeHGlobal($TibPtr)
     [System.Runtime.InteropServices.Marshal]::FreeHGlobal($RspBuffer)
 
-    Write-Output $Suspicious
+    if($ReturnModules.Count -eq 0)
+    {
+        return
+    }
+    
+    # 5. Validate the initial inferred call stack frames
+    $StackSummary = ($ReturnModules | ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_) }) -join ';'
+
+    # Has the thread been hijacked before Win32StartAddress was called?
+    if (($ReturnModules -notcontains $StartAddressModule) -and
+        # .NET executables always intially jump to the CLR runtime.
+        ($ReturnModules[2] -notmatch "^[A-Z]:\\Windows\\Microsoft.NET\\Framework(32|64)\\.*\\(clr|mscorwks)\.dll$") -and
+        # WindowsApps executables sometimes just jump to a dll of the same name!
+        ($ReturnModules[2] -notcontains $StartAddressModule.Replace(".exe", ".dll")))
+    {
+        $Detections += "hijacked($($StackSummary))"
+    }
+
+    # Is the stack base normal?
+    # Note - MSYS2 will false positive here due to how it implements Linux-style threading.
+    elseif (($ReturnModules[0] -notmatch "^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\ntdll\.dll$") -or 
+            ($ReturnModules[1] -and ($ReturnModules[1] -notmatch "^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\kernel32\.dll$")))
+    {
+        $Detections += "hijacked($($StackSummary))"
+    }
+    
+    # Has a private start address been called indirectly via a wrapper function?
+    elseif ($Unbacked)
+    {
+        $Detections += "wrapper($($StackSummary))"
+    }
+    
+    Write-Output $Detections
 }
 
 function Get-LogonSession
