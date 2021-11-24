@@ -347,26 +347,15 @@ function Get-InjectedThreadEx
                 if (($MemoryType -eq $MemType::MEM_IMAGE) -and
                     $PrivatePage)
                 {
-                    $Detections += 'modified'
+                    $Detections += 'hooked'
                 }
 
-                # Has the CFG BitMap entry for Win32StartAddress been modifed post load? e.g. SetProcessValidCallTargets
-                # Note - exe BitMap entries are not shared, only dll BitMap entries.
-                if ((-not $IsWow64Process) -and
+                # Check for suspcious CFG BitMap states
+                if ((-not $IsWow64Process) -and                 # TODO(jdu) Wow64 support not implemented
                     ([IntPtr]::Zero -ne $CfgBitMapAddress) -and
-                    ($MemoryType -eq $MemType::MEM_IMAGE) -and
-                    ($StartAddressModule -notmatch '\.exe$') -and
-                    (IsCfgBitMapPrivate -pCfgBitMap $CfgBitMapAddress -ProcessHandle $hProcess -Address $Win32StartAddress))
+                    ($MemoryType -eq $MemType::MEM_IMAGE))
                 {
-                    $Detections += 'cfg_modified'
-                }
-
-                # Is this address marked as 'export suppressed' in the CFG BitMap?
-                if (([IntPtr]::Zero -ne $CfgBitMapAddress) -and
-                    ($MemoryType -eq $MemType::MEM_IMAGE) -and
-                    (IsAddressCfgExportSuppressed -pCfgBitMap $CfgBitMapAddress -ProcessHandle $hProcess -Address $Win32StartAddress))
-                {
-                    $Detections += 'cfg_export_suppressed'
+                    $Detections += (CfgDetections -pCfgBitMap $CfgBitMapAddress -ProcessHandle $hProcess -Address $Win32StartAddress)
                 }
 
                 ### Suspicious start modules
@@ -377,15 +366,15 @@ function Get-InjectedThreadEx
                     $Detections += 'unsigned'
                 }
 
+                # Check for suspcious call stacks
                 # https://www.trustedsec.com/blog/avoiding-get-injectedthread-for-internal-thread-creation/
                 $WrapperRegex = '^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\((msvcr[t0-9]+|ucrtbase)d?|SHCore|Shlwapi)\.dll$'
                 if ((-not $IsWow64Process) -and                   # TODO(jdu) Wow64 support not implemented
-                    ((-not $Faster) -or                             # This check is expensive.
+                    ((-not $Faster) -or                           # This check is expensive.
                     ($StartAddressModule -match $WrapperRegex)))  # Always perform if a known wrapper module.
                 {
                     $Detections += (CallStackDetections -ProcessHandle $hProcess -ThreadHandle $hThread -StartAddressModule $StartAddressModule -Aggressive $Aggressive)
                 }
-
                 
                 # There are no valid thread entry points (that I know of) in many Win32 modules.
                 $ModulesWithoutThreadEntries = @(
@@ -394,7 +383,7 @@ function Get-InjectedThreadEx
                     ('^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\user32\.dll$', 'user32'),
                     ('^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\shell32\.dll$', 'shell32'),
                     ('^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\advapi32\.dll$', 'advapi32')
-                    # ... and more
+                    # ... and many more
                 );
                 foreach ($Module in $ModulesWithoutThreadEntries)
                 {
@@ -509,7 +498,7 @@ function Get-InjectedThreadEx
 
                 # Definitely not a smoking gun on its own, but obfuscate-and-sleep approaches are becoming popular.
                 if (($Detections.Length -ne 0) -and 
-                    ($Thread.WaitReason -ne $null) -and
+                    ($null -ne $Thread.WaitReason) -and
                     ($Thread.WaitReason.ToString() -eq 'ExecutionDelay'))
                 {
                     $Detections += "sleep"
@@ -627,12 +616,12 @@ function GetCfgBitMapAddress
     return [IntPtr]$pCfgBitmap
 }
 
-function IsCfgBitMapPrivate
+function CfgDetections
 {
 <#
 .SYNOPSIS
 
-Returns whether the CFG BitMap entry in the target process for the specified address is private.
+Checks the CFG BitMap for anomalies related to the given Address.
 
 .DESCRIPTION
 
@@ -672,113 +661,45 @@ Author - John Uhlmann (@jdu2600)
 
     )
 
+    $Detections = @()
+
     # Read the location of the CFG BitMap address in our process
-    $Buffer = ReadProcessMemory -ProcessHandle $hProcess -BaseAddress $pCfgBitmap -Size $([IntPtr]::Size)
+    $Buffer = ReadProcessMemory -ProcessHandle $ProcessHandle -BaseAddress $pCfgBitmap -Size $([IntPtr]::Size)
     $CfgBitmap = if ([IntPtr]::Size -eq 8) {[System.BitConverter]::ToInt64($Buffer, 0)} else {[System.BitConverter]::ToInt32($Buffer, 0)}
     if($CfgBitmap -eq 0)
     {
-        return $false # CFG is not enabled
+        return # CFG is not enabled
     }
 
     # Validate the CFG BitMap
-    $MemoryBasicInfo = VirtualQueryEx -ProcessHandle $hProcess -BaseAddress $CfgBitmap
+    $MemoryBasicInfo = VirtualQueryEx -ProcessHandle $ProcessHandle -BaseAddress $CfgBitmap
     if($MemoryBasicInfo.AllocationBase -ne [UIntPtr]([UInt64]$CfgBitmap))
     {
         Write-Warning "CFG BitMap address not found at 0x$($CfgBitmap.ToString('x'))"
-        return $false
+        return
     }
 
     # Find the CFG entry for target address
     $CfgIndexShift = if ([IntPtr]::Size -eq 8) {9} else {8}
     $pCfgEntry = $CfgBitmap + ($Address.ToInt64() -shr $CfgIndexShift) * [IntPtr]::Size
-    $MemoryBasicInfo = VirtualQueryEx -ProcessHandle $hProcess -BaseAddress $pCfgEntry
+    $MemoryBasicInfo = VirtualQueryEx -ProcessHandle $ProcessHandle -BaseAddress $pCfgEntry
     if (($MemoryBasicInfo.State -ne $MemState::MEM_COMMIT) -or
         ($MemoryBasicInfo.Type -ne $MemType::MEM_MAPPED) -or
         ($MemoryBasicInfo.Protect -eq $MemProtect::PAGE_NOACCESS))
     {
         Write-Warning "Invalid CFG Entry for 0x$($Address.ToString('x'))"
-        return $false
+        return
     }
 
-    return (IsWorkingSetPage -ProcessHandle $hProcess -Address $pCfgEntry)
-}
-
-function IsAddressCfgExportSuppressed
-{
-<#
-.SYNOPSIS
-
-Returns whether the CFG BitMap entry in the target process for the specified address is marked export suppressed.
-
-.DESCRIPTION
-
-.PARAMETER pCfgBitMap
-
-The address of ntdll!LdrSystemDllInitBlock.CfgBitMap
-
-.PARAMETER ProcessHandle
-
-A read handle to the target process.
-
-.PARAMETER Address
-
-The address to check.
-
-.NOTES
-
-Author - John Uhlmann (@jdu2600)
-
-.LINK
-
-.EXAMPLE
-#>
-    param
-    (
-        [Parameter(Mandatory = $true)]
-        [IntPtr]
-        $pCfgBitMap,
-
-        [Parameter(Mandatory = $true)]
-        [IntPtr]
-        $ProcessHandle,
-
-        [Parameter(Mandatory = $true)]
-        [IntPtr]
-        $Address
-
-    )
-
-    # Read the location of the CFG BitMap address in our process
-    $Buffer = ReadProcessMemory -ProcessHandle $hProcess -BaseAddress $pCfgBitmap -Size $([IntPtr]::Size)
-    $CfgBitmap = if ([IntPtr]::Size -eq 8) {[System.BitConverter]::ToInt64($Buffer, 0)} else {[System.BitConverter]::ToInt32($Buffer, 0)}
-    if($CfgBitmap -eq 0)
+    $AddressModule = GetMappedFileName -ProcessHandle $ProcessHandle -Address $Address
+    if (($AddressModule -notmatch '\.exe$') -and
+        (IsWorkingSetPage -ProcessHandle $ProcessHandle -Address $pCfgEntry))
     {
-        return $false # CFG is not enabled
+        $Detections += "cfg_modified"
     }
 
-    # Validate the CFG BitMap
-    $MemoryBasicInfo = VirtualQueryEx -ProcessHandle $hProcess -BaseAddress $CfgBitmap
-    if($MemoryBasicInfo.AllocationBase -ne [UIntPtr]([UInt64]$CfgBitmap))
-    {
-        Write-Warning "CFG BitMap address not found at 0x$($CfgBitmap.ToString('x'))"
-        return $false
-    }
-
-    # Find the CFG entry for target address
-    $CfgIndexShift = if ([IntPtr]::Size -eq 8) {9} else {8}
-    $pCfgEntry = $CfgBitmap + ($Address.ToInt64() -shr $CfgIndexShift) * [IntPtr]::Size
-    $MemoryBasicInfo = VirtualQueryEx -ProcessHandle $hProcess -BaseAddress $pCfgEntry
-    if (($MemoryBasicInfo.State -ne $MemState::MEM_COMMIT) -or
-        ($MemoryBasicInfo.Type -ne $MemType::MEM_MAPPED) -or
-        ($MemoryBasicInfo.Protect -eq $MemProtect::PAGE_NOACCESS))
-    {
-        Write-Warning "Invalid CFG Entry for 0x$($Address.ToString('x'))"
-        return $false
-    }
-
-    $Buffer = ReadProcessMemory -ProcessHandle $hProcess -BaseAddress $pCfgEntry -Size $([IntPtr]::Size)
+    $Buffer = ReadProcessMemory -ProcessHandle $ProcessHandle -BaseAddress $pCfgEntry -Size $([IntPtr]::Size)
     $CfgEntry = if ([IntPtr]::Size -eq 8) {[System.BitConverter]::ToInt64($Buffer, 0)} else {[System.BitConverter]::ToInt32($Buffer, 0)}
-    
     
     # Check the relevant bits for address in this entry
     $CfgOffsetMask = (([IntPtr]::Size -shl 3) - 2)
@@ -789,7 +710,27 @@ Author - John Uhlmann (@jdu2600)
     # 10 - this range contains an export-suppressed target
     # 11 - all addresses in this range are valid.
     
-    return $BitPair -eq 2 # this range contains an export-suppressed target
+    # export suppressed CFG addresses are suspicious thread start addresses
+    if($BitPair -eq 2)
+    {
+        $Detections += 'cfg_export_suppressed'
+    }
+    
+    # Was CFG bypassed?
+    elseif(($Address.ToInt64() -band 0xF) -eq 0)
+    {
+        # 16-byte aligned check
+        if(($BitPair -band 1) -eq 0)
+        {
+            $Detections += 'cfg'
+        }
+    }
+    elseif ($BitPair -ne 3)
+    {
+        $Detections += 'cfg'
+    }
+
+    Write-Output $Detections
 }
 
 function CallStackDetections
@@ -936,7 +877,7 @@ Author - John Uhlmann (@jdu2600)
     }
     
     # 5. Validate the initial inferred call stack frames
-    $StackSummary = ($ReturnModules | ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_) }) -join ';'
+    $StackSummary = (($ReturnModules | ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_) }) -join ';').Replace("ntdll;kernel32;", "")
 
     # Has the thread been hijacked before Win32StartAddress was called?
     if (($ReturnModules -notcontains $StartAddressModule) -and
