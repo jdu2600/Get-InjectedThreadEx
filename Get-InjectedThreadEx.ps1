@@ -17,6 +17,11 @@ function Get-InjectedThreadEx
 
     NOTE: Nothing in security is a silver bullet. An attacker could modify their tactics to avoid detection using this methodology.
     
+    KNOWN LIMITATIONS:
+    - PowerShell 2 is not supported - no bitwise arithemtic shift operators.
+    - 32-bit Windows support not implemented.
+    - Limited WOW64 support.
+
     .PARAMETER Aggressive
     Enables additional scans that have higher false positive rates.
 
@@ -361,17 +366,19 @@ function Get-InjectedThreadEx
                 ### Suspicious start modules
 
                 # unsigned module in signed process - e.g. dll sideloading
-                if ($WindowsVersion -ge 10 -and $ProcessModuleSigned -and -not $StartAddressModuleSigned)
+                if (($WindowsVersion -ge 10) -and $ProcessModuleSigned -and -not $StartAddressModuleSigned)
                 {
                     $Detections += 'unsigned'
                 }
 
-                # Check for suspcious call stacks
+                # Check for suspicious call stacks
                 # https://www.trustedsec.com/blog/avoiding-get-injectedthread-for-internal-thread-creation/
+                
                 $WrapperRegex = '^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\((msvcr[t0-9]+|ucrtbase)d?|SHCore|Shlwapi)\.dll$'
-                if ((-not $IsWow64Process) -and                   # TODO(jdu) Wow64 support not implemented
-                    ((-not $Faster) -or                           # This check is expensive.
-                    ($StartAddressModule -match $WrapperRegex)))  # Always perform if a known wrapper module.
+                if ((-not $IsWow64Process) -and                     # TODO(jdu) Wow64 support not implemented
+                    ($Aggressive -or ($WindowsVersion -ge 10)) -and # FPs rates are higher on older OS versions
+                    ((-not $Faster) -or                             # This check is expensive.
+                    ($StartAddressModule -match $WrapperRegex)))    # Always perform if a known wrapper module.
                 {
                     $Detections += (CallStackDetections -ProcessHandle $hProcess -ThreadHandle $hThread -StartAddressModule $StartAddressModule -Aggressive $Aggressive)
                 }
@@ -381,7 +388,6 @@ function Get-InjectedThreadEx
                     ('^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\kernel32\.dll$', 'kernel32'),
                     ('^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\kernelbase\.dll$', 'kernelbase'),
                     ('^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\user32\.dll$', 'user32'),
-                    ('^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\shell32\.dll$', 'shell32'),
                     ('^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\advapi32\.dll$', 'advapi32')
                     # ... and many more
                 );
@@ -417,18 +423,11 @@ function Get-InjectedThreadEx
 
                 if ($IsUniqueThreadToken)
                 {
-                    if ($ProcessIntegrity -ne 'SYSTEM_MANDATORY_LEVEL')
+                    # Is SYSTEM being impersonated?
+                    if(($ProcessLogonSession.UserName -ne "SYSTEM") -and 
+                        ($ThreadLogonSession.UserName -eq "SYSTEM"))
                     {
-                        if ($ThreadIntegrity -eq 'SYSTEM_MANDATORY_LEVEL')
-                        {
-                            $Detections += 'SystemToken'
-                        }
-
-                        if (($ProcessIntegrity -ne 'HIGH_MANDATORY_LEVEL') -and
-                            ($ThreadIntegrity -eq 'HIGH_MANDATORY_LEVEL'))
-                        {
-                            $Detections += 'AdminToken'
-                        }
+                        $Detections += 'SYSTEM'
                     }
 
                     $NewPrivileges = @()
@@ -588,26 +587,26 @@ function GetCfgBitMapAddress
     # 180033520  ntdll!LdrControlFlowGuardEnforced
     # 180033520  48833d80be140000  CMP qword ptr[LdrSystemDllInitBlock.CfgBitMap], 0x0
     $LdrControlFlowGuardEnforced = GetProcAddress -ModuleName "ntdll.dll" -ProcName "LdrControlFlowGuardEnforced"
-    if($LdrControlFlowGuardEnforced -eq 0)
+    if ($LdrControlFlowGuardEnforced -eq 0)
     {
         return [IntPtr]::Zero # CFG not supported on this platform
     }
 
     $Offset = [System.Runtime.InteropServices.Marshal]::ReadInt32($LdrControlFlowGuardEnforced.ToInt64() + 3)
     $pCfgBitMap = $LdrControlFlowGuardEnforced.ToInt64() + 8 + $Offset
-    
+
     # Read the value of the CFG BitMap address in our CFG-Enabled PowerShell process
     $CfgBitMap = [System.Runtime.InteropServices.Marshal]::ReadIntPtr($pCfgBitMap)
-    if($CfgBitMap -eq [IntPtr]::Zero)
+    if ($CfgBitMap -eq [IntPtr]::Zero)
     {
         Write-Warning "CFG BitMap address not found at 0x$($CfgBitmap.ToString('x'))"
         return [IntPtr]::Zero
     }
-    
+
     # Validate the CFG BitMap address
     $CurrentProcess = [IntPtr](-1)
     $MemoryBasicInfo = VirtualQueryEx -ProcessHandle $CurrentProcess -BaseAddress $CfgBitMap
-    if($MemoryBasicInfo.AllocationBase -ne [UIntPtr]([UInt64]$CfgBitMap.ToInt64()))
+    if ($MemoryBasicInfo.AllocationBase -ne [UIntPtr]([UInt64]$CfgBitMap.ToInt64()))
     {
         Write-Warning "CFG BitMap address not valid at 0x$($CfgBitmap.ToString('x'))"
         return [IntPtr]::Zero
@@ -678,14 +677,17 @@ Author - John Uhlmann (@jdu2600)
         Write-Warning "CFG BitMap address not found at 0x$($CfgBitmap.ToString('x'))"
         return
     }
+    
+    # TODO(jdu) - implement bitwise shift operations to support PowerShell 2.
+    # Perhaps https://github.com/vrimkus/PoSh2.0-BitShifting
 
     # Find the CFG entry for target address
-    $CfgIndexShift = if ([IntPtr]::Size -eq 8) {9} else {8}
+    $CfgIndexShift = if ([IntPtr]::Size -eq 8) { 9 } else { 8 }
     $pCfgEntry = $CfgBitmap + ($Address.ToInt64() -shr $CfgIndexShift) * [IntPtr]::Size
     $MemoryBasicInfo = VirtualQueryEx -ProcessHandle $ProcessHandle -BaseAddress $pCfgEntry
     if (($MemoryBasicInfo.State -ne $MemState::MEM_COMMIT) -or
-        ($MemoryBasicInfo.Type -ne $MemType::MEM_MAPPED) -or
-        ($MemoryBasicInfo.Protect -eq $MemProtect::PAGE_NOACCESS))
+    ($MemoryBasicInfo.Type -ne $MemType::MEM_MAPPED) -or
+    ($MemoryBasicInfo.Protect -eq $MemProtect::PAGE_NOACCESS))
     {
         Write-Warning "Invalid CFG Entry for 0x$($Address.ToString('x'))"
         return
@@ -699,8 +701,8 @@ Author - John Uhlmann (@jdu2600)
     }
 
     $Buffer = ReadProcessMemory -ProcessHandle $ProcessHandle -BaseAddress $pCfgEntry -Size $([IntPtr]::Size)
-    $CfgEntry = if ([IntPtr]::Size -eq 8) {[System.BitConverter]::ToInt64($Buffer, 0)} else {[System.BitConverter]::ToInt32($Buffer, 0)}
-    
+    $CfgEntry = if ([IntPtr]::Size -eq 8) { [System.BitConverter]::ToInt64($Buffer, 0) } else { [System.BitConverter]::ToInt32($Buffer, 0) }
+
     # Check the relevant bits for address in this entry
     $CfgOffsetMask = (([IntPtr]::Size -shl 3) - 2)
     $BitPairOffset = ($Address.ToInt64() -shr 3) -band $CfgOffsetMask
@@ -709,18 +711,18 @@ Author - John Uhlmann (@jdu2600)
     # 01 - the only valid target is 16-byte aligned
     # 10 - this range contains an export-suppressed target
     # 11 - all addresses in this range are valid.
-    
+
     # export suppressed CFG addresses are suspicious thread start addresses
-    if($BitPair -eq 2)
+    if ($BitPair -eq 2)
     {
         $Detections += 'cfg_export_suppressed'
     }
-    
+
     # Was CFG bypassed?
-    elseif(($Address.ToInt64() -band 0xF) -eq 0)
+    elseif (($Address.ToInt64() -band 0xF) -eq 0)
     {
         # 16-byte aligned check
-        if(($BitPair -band 1) -eq 0)
+        if (($BitPair -band 1) -eq 0)
         {
             $Detections += 'cfg'
         }
@@ -813,7 +815,7 @@ Author - John Uhlmann (@jdu2600)
     $Tib = $TibPtr -as $TIB64
 
     # 3. Read the (partial) stack contents
-    $StackReadLength = [math]::Min(0x2000, [Int64]$Tib.StackBase - [Int64]$Tib.StackLimit)
+    $StackReadLength = [math]::Min(0x1000, [Int64]$Tib.StackBase - [Int64]$Tib.StackLimit)
     $StackBuffer = ReadProcessMemory -ProcessHandle $ProcessHandle -BaseAddress ([Int64]$Tib.StackBase - $StackReadLength) -Size $StackReadLength
 
     # 4. Search the stack bottom up for the (probable) initial return addresses of the first 5 frames.
@@ -860,6 +862,7 @@ Author - John Uhlmann (@jdu2600)
                 }
 
                 Write-Verbose -Message "  * Stack +0x$($i.ToString('x')): $($CandidateRspModule)"
+                $i += 32 # skip parameter shadow space
 
                 if (($ReturnModules.Count -eq 0) -or ($ReturnModules[$ReturnModules.Count-1] -ne $CandidateRspModule))
                 {
@@ -881,8 +884,8 @@ Author - John Uhlmann (@jdu2600)
 
     # Has the thread been hijacked before Win32StartAddress was called?
     if (($ReturnModules -notcontains $StartAddressModule) -and
-        # .NET executables always intially jump to the CLR runtime.
-        ($ReturnModules[2] -notmatch "^[A-Z]:\\Windows\\Microsoft.NET\\Framework(32|64)\\.*\\(clr|mscorwks)\.dll$") -and
+        # .NET executables always intially jump to the CLR runtime startup shim mscoree!_CorExeMain.
+        ($ReturnModules[2] -notmatch "^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\mscoree\.dll$") -and
         # WindowsApps executables sometimes just jump to a dll of the same name!
         ($ReturnModules[2] -notcontains $StartAddressModule.Replace(".exe", ".dll")))
     {
