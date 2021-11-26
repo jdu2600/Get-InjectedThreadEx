@@ -330,7 +330,8 @@ function Get-InjectedThreadEx
                 }
 
                 $x86PrologRegex = '^(' +
-                '(8bff)?55(8bec|89e5)' +       # stack pointer
+                '(8bff)?(6690)?' +             # 2-byte nop
+                '55(8bec|89e5)' +              # stack pointer
                 '|(..)+8[13]ec' +              # sub esp,nnnn
                 '|(6a..|(68|b8)........)*e8' + # call
                 '|e9|ff25' +                   # jmp
@@ -421,36 +422,6 @@ function Get-InjectedThreadEx
                     $Detections += 'ntdll'
                 }
 
-                if ($IsUniqueThreadToken)
-                {
-                    # Is SYSTEM being impersonated?
-                    if(($ProcessLogonSession.UserName -ne "SYSTEM") -and 
-                        ($ThreadLogonSession.UserName -eq "SYSTEM"))
-                    {
-                        $Detections += 'SYSTEM'
-                    }
-
-                    $NewPrivileges = @()
-                    foreach ($Privilege in $ThreadPrivs -split ', ')
-                    {
-                        if ($ProcessPrivs -notmatch $Privilege)
-                        {
-                            $NewPrivileges += $Privilege
-                        }
-                    }
-                    $NewPrivileges = $NewPrivileges -join ', '
-
-                    # Known additional privileges
-                    # SysMain (sechost.dll) -> SeTakeOwnership
-                    $SysMainService = '^[A-Z]:\\Windows\\System32\\sechost.dll$'
-
-                    if (($NewPrivileges.Length -ne 0) -and
-                        -not ($StartAddressModule -match $SysMainService -and $NewPrivileges -eq 'SeTakeOwnershipPrivilege'))
-                    {
-                        $Detections += $NewPrivileges
-                    }
-                }
-
                 # The byte preceding a function prolog is typically a return, or filler byte.
                 # False positives can occur if data was included in a code section. This was
                 # common in older compilers.
@@ -493,6 +464,13 @@ function Get-InjectedThreadEx
                     {
                         $Detections += 'alignment'
                     }
+                }
+
+                # Is SYSTEM being impersonated?
+                if (($ProcessSID -ne "S-1-5-18") -and 
+                    ($ThreadSID -eq "S-1-5-18"))
+                {
+                    $Detections += 'SYSTEM impersonation'
                 }
 
                 # Definitely not a smoking gun on its own, but obfuscate-and-sleep approaches are becoming popular.
@@ -815,7 +793,7 @@ Author - John Uhlmann (@jdu2600)
     $Tib = $TibPtr -as $TIB64
 
     # 3. Read the (partial) stack contents
-    $StackReadLength = [math]::Min(0x1000, [Int64]$Tib.StackBase - [Int64]$Tib.StackLimit)
+    $StackReadLength = [math]::Min(0x2000, [Int64]$Tib.StackBase - [Int64]$Tib.StackLimit)
     $StackBuffer = ReadProcessMemory -ProcessHandle $ProcessHandle -BaseAddress ([Int64]$Tib.StackBase - $StackReadLength) -Size $StackReadLength
 
     # 4. Search the stack bottom up for the (probable) initial return addresses of the first 5 frames.
@@ -825,8 +803,9 @@ Author - John Uhlmann (@jdu2600)
     $Detections = @()
     $Unbacked = $false
     $ReturnModules = @()
-    # x64 stack frames are 16-byte aligned
+    # Our return addresses are only probable as we're not stack walking. Collect up to 5 in case of false positives.
     $MaxFrameCount = 5
+    # x64 stack frames are 16-byte aligned, and return addresses are 8-byte aligned.
     for ($i = 8; ($ReturnModules.Count -lt $MaxFrameCount) -and ($i -lt $StackReadLength); $i += 16)
     {
         [System.Runtime.InteropServices.Marshal]::Copy($StackBuffer, ($StackReadLength - $i), $RspBuffer, [IntPtr]::Size)
@@ -862,11 +841,16 @@ Author - John Uhlmann (@jdu2600)
                 }
 
                 Write-Verbose -Message "  * Stack +0x$($i.ToString('x')): $($CandidateRspModule)"
-                $i += 32 # skip parameter shadow space
 
                 if (($ReturnModules.Count -eq 0) -or ($ReturnModules[$ReturnModules.Count-1] -ne $CandidateRspModule))
                 {
+                    
                     $ReturnModules +=  $CandidateRspModule;
+                    
+                    if (($ReturnModules.Count -le 2) -and ($CandidateRspModule -match "^[A-Z]:\\Windows\\System32\\(ntdll|kernel32)\.dll$"))
+                    {
+                        $i += 32 # skip parameter shadow space - this helps with FPs
+                    }
                 }
             }
         }
@@ -883,7 +867,10 @@ Author - John Uhlmann (@jdu2600)
     $StackSummary = (($ReturnModules | ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_) }) -join ';').Replace("ntdll;kernel32;", "")
 
     # Has the thread been hijacked before Win32StartAddress was called?
-    if (($ReturnModules -notcontains $StartAddressModule) -and
+    if ($Aggressive -and
+        # Our "call stack" is a rough approximation - and could cause false positives.
+        # Also, the Win32StartAddress function could be a Tail Call Optimized (TCO).
+        ($ReturnModules -notcontains $StartAddressModule) -and
         # .NET executables always intially jump to the CLR runtime startup shim mscoree!_CorExeMain.
         ($ReturnModules[2] -notmatch "^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\mscoree\.dll$") -and
         # WindowsApps executables sometimes just jump to a dll of the same name!
@@ -893,7 +880,7 @@ Author - John Uhlmann (@jdu2600)
     }
 
     # Is the stack base normal?
-    # Note - MSYS2 will false positive here due to how it implements Linux-style threading.
+    # Note - MSYS2 will false positive here.
     elseif (($ReturnModules[0] -notmatch "^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\ntdll\.dll$") -or 
             ($ReturnModules[1] -and ($ReturnModules[1] -notmatch "^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\kernel32\.dll$")))
     {
@@ -901,11 +888,17 @@ Author - John Uhlmann (@jdu2600)
     }
     
     # Has a private start address been called indirectly via a wrapper function?
-    elseif ($Unbacked)
+    elseif ($Unbacked -and ($ReturnModules -contains $StartAddressModule))
     {
         $Detections += "wrapper($($StackSummary))"
     }
     
+    # Is there a private start address near the bottom of the stack?
+    elseif ($Unbacked)
+    {
+        $Detections += "early_unbacked($($StackSummary))"
+    }
+
     Write-Output $Detections
 }
 
