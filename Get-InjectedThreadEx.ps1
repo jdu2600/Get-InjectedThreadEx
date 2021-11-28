@@ -371,19 +371,7 @@ function Get-InjectedThreadEx
                 {
                     $Detections += 'unsigned'
                 }
-
-                # Check for suspicious call stacks
-                # https://www.trustedsec.com/blog/avoiding-get-injectedthread-for-internal-thread-creation/
-                
-                $WrapperRegex = '^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\((msvcr[t0-9]+|ucrtbase)d?|SHCore|Shlwapi)\.dll$'
-                if ((-not $IsWow64Process) -and                     # TODO(jdu) Wow64 support not implemented
-                    ($Aggressive -or ($WindowsVersion -ge 10)) -and # FPs rates are higher on older OS versions
-                    ((-not $Faster) -or                             # This check is expensive.
-                    ($StartAddressModule -match $WrapperRegex)))    # Always perform if a known wrapper module.
-                {
-                    $Detections += (CallStackDetections -ProcessHandle $hProcess -ThreadHandle $hThread -StartAddressModule $StartAddressModule -Aggressive $Aggressive)
-                }
-                
+               
                 # There are no valid thread entry points (that I know of) in many Win32 modules.
                 $ModulesWithoutThreadEntries = @(
                     ('^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\kernel32\.dll$', 'kernel32'),
@@ -420,6 +408,25 @@ function Get-InjectedThreadEx
                     ($NtdllThreads64 -notcontains $Win32StartAddress))
                 {
                     $Detections += 'ntdll'
+                }
+
+                # Is SYSTEM being impersonated?
+                if (($ProcessSID -ne "S-1-5-18") -and 
+                        ($ThreadSID -eq "S-1-5-18"))
+                {
+                    $Detections += 'SYSTEM impersonation'
+                }
+            
+                # Check for suspicious call stacks
+                # https://www.trustedsec.com/blog/avoiding-get-injectedthread-for-internal-thread-creation/
+                
+                $WrapperRegex = '^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\((msvcr[t0-9]+|ucrtbase)d?|SHCore|Shlwapi)\.dll$'
+                if ((-not $IsWow64Process) -and                     # TODO(jdu) Wow64 support not implemented
+                    ($StartAddressModule -match $WrapperRegex) -or  # Always perform if a known wrapper module.    
+                    $Aggressive -or
+                    ($Detections.Length -ne 0))
+                {
+                    $Detections += (CallStackDetections -ProcessHandle $hProcess -ThreadHandle $hThread -StartAddressModule $StartAddressModule -Aggressive $Aggressive)
                 }
 
                 # The byte preceding a function prolog is typically a return, or filler byte.
@@ -464,13 +471,6 @@ function Get-InjectedThreadEx
                     {
                         $Detections += 'alignment'
                     }
-                }
-
-                # Is SYSTEM being impersonated?
-                if (($ProcessSID -ne "S-1-5-18") -and 
-                    ($ThreadSID -eq "S-1-5-18"))
-                {
-                    $Detections += 'SYSTEM impersonation'
                 }
 
                 # Definitely not a smoking gun on its own, but obfuscate-and-sleep approaches are becoming popular.
