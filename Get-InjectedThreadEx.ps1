@@ -25,9 +25,6 @@ function Get-InjectedThreadEx
     .PARAMETER Aggressive
     Enables additional scans that have higher false positive rates.
 
-    .PARAMETER Faster
-    Disables slower scans that typically overlap with other detections.
-
     .PARAMETER ProcessId
     Only scans the specified pid.
 
@@ -95,9 +92,6 @@ function Get-InjectedThreadEx
 
         [Parameter()]
         [Switch]$Brief,
-
-        [Parameter()]
-        [Switch]$Faster,
 
         [Parameter()]
         [UInt32]$ProcessId
@@ -270,13 +264,13 @@ function Get-InjectedThreadEx
             #  - MEM_IMAGE and x64 and Win32StartAddress is unexpected prolog
             #  - MEM_IMAGE and Win32StartAddress is on a private (modified) page
             #  - MEM_IMAGE and dll and Win32StartAddress entry in CFG BitMap is on a private (modified) page
+            #  - MEM_IMAGE and dll and Win32StartAddress is CFG violation or suppressed export
             #  - MEM_IMAGE and Win32StartAddress is in a suspicious module
-            #  - MEM_IMAGE and Win32StartAddress is missing from call stack
-            #  - MEM_IMAGE and dll and Win32StartAddress is CFG suppressed export (-Aggressive only)
+            #  - MEM_IMAGE and x64 and Win32StartAddress wraps non-MEM_IMAGE start address
             #  - MEM_IMAGE and Win32StartAddress is preceded by unexpected byte (-Aggressive only)
+            #  - MEM_IMAGE and x64 and Win32StartAddress is missing from call stack (-Aggressive only)
             #  - MEM_IMAGE and x64 and Win32StartAddress is not 16-byte aligned (-Aggressive only)
-            #  - Thread has a higher integrity level than process
-            #  - Thread has additional unexpected privileges
+            #  - Thread is impersonating SYSTEM
             #  - Thread is sleeping (enrichment only)
             #################################################################################################
 
