@@ -665,11 +665,19 @@ Author - John Uhlmann (@jdu2600)
         return
     }
 
-    $AddressModule = GetMappedFileName -ProcessHandle $ProcessHandle -Address $Address
-    if (($AddressModule -notmatch '\.exe$') -and
-        (IsWorkingSetPage -ProcessHandle $ProcessHandle -Address $pCfgEntry))
+    if (IsWorkingSetPage -ProcessHandle $ProcessHandle -Address $pCfgEntry)
     {
-        $Detections += "cfg_modified"
+        $AddressModule = GetMappedFileName -ProcessHandle $ProcessHandle -Address $Address
+        $ProcessExecutable = QueryFullProcessImageName -ProcessHandle $hProcess
+
+        # executable CFG bitmaps are not shared - only library (dll) ones.
+        # https://www.trendmicro.com/en_us/research/16/j/control-flow-guard-improvements-windows-10-anniversary-update.html
+        # MicrosoftEdgeCP.exe modifies its CFG bitmap
+        if(($AddressModule -notmatch '\.exe$') -and
+            ($ProcessExecutable -notmatch '^[A-Z]:\\Windows\\System32\\MicrosoftEdgeCP\.exe$'))
+        {
+            $Detections += "cfg_modified"
+        }
     }
 
     $Buffer = ReadProcessMemory -ProcessHandle $ProcessHandle -BaseAddress $pCfgEntry -Size $([IntPtr]::Size)
@@ -834,7 +842,7 @@ Author - John Uhlmann (@jdu2600)
                     $MaxFrameCount = [math]::Min($MaxFrameCount, $ReturnModules.Count + 2)
                 }
 
-                Write-Verbose -Message "  * Stack +0x$($i.ToString('x')): $($CandidateRspModule)"
+                Write-Verbose -Message "  * Stack [0x$($CandidateRsp.ToString('x'))] +0x$($i.ToString('x')): $($CandidateRspModule) "
 
                 if (($ReturnModules.Count -eq 0) -or ($ReturnModules[$ReturnModules.Count-1] -ne $CandidateRspModule))
                 {
