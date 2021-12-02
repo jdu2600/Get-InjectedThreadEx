@@ -878,7 +878,7 @@ Author - John Uhlmann (@jdu2600)
         # WindowsApps executables sometimes just jump to a dll of the same name!
         ($ReturnModules[2] -notcontains $StartAddressModule.Replace(".exe", ".dll")) -and
         # WoW64 thread
-        $StackSummary -notmatch "^ntdll;wow64;wow64cpu;wow64")
+        $StackSummary -notmatch "^ntdll;wow64;wow64cpu;")
     {
         $Detections += "hijacked($($StackSummary))"
     }
