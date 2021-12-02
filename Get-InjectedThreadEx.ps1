@@ -427,7 +427,7 @@ function Get-InjectedThreadEx
                 # False positives can occur if data was included in a code section. This was
                 # common in older compilers.
                 # In practice, this has a medium FP rate - so don't check by default.
-                $x64EpilogFillerRegex = '(00|90|c3|cc|(e8|e9|ff25)........|^)$'
+                $x64EpilogFillerRegex = '(00|90|c3|cc|(e8|e9|ff25)........|eb..|^)$'
                 if (($Aggressive -or ($Detections.Length -ne 0)) -and
                     ($TailBytes -notmatch $x64EpilogFillerRegex))
                 {
@@ -672,9 +672,9 @@ Author - John Uhlmann (@jdu2600)
 
         # executable CFG bitmaps are not shared - only library (dll) ones.
         # https://www.trendmicro.com/en_us/research/16/j/control-flow-guard-improvements-windows-10-anniversary-update.html
-        # MicrosoftEdgeCP.exe modifies its CFG bitmap
+        # The original Microsoft Edge modifies its CFG bitmap
         if(($AddressModule -notmatch '\.exe$') -and
-            ($ProcessExecutable -notmatch '^[A-Z]:\\Windows\\System32\\MicrosoftEdgeCP\.exe$'))
+            ($ProcessExecutable -notmatch '^[A-Z]:\\Windows\\.*\\MicrosoftEdge(CP|SH)?\.exe$'))
         {
             $Detections += "cfg_modified"
         }
@@ -886,7 +886,7 @@ Author - John Uhlmann (@jdu2600)
     # Is the stack base normal?
     # Note - MSYS2 will false positive here.
     elseif (($ReturnModules[0] -notmatch "^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\ntdll\.dll$") -or 
-            ($ReturnModules[1] -and ($ReturnModules[1] -notmatch "^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\kernel32\.dll$")))
+            ($ReturnModules[1] -and ($ReturnModules[1] -notmatch "^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\(wow64|kernel32)\.dll$")))
     {
         $Detections += "hijacked($($StackSummary))"
     }
