@@ -876,7 +876,9 @@ Author - John Uhlmann (@jdu2600)
         # .NET executables always intially jump to the CLR runtime startup shim mscoree!_CorExeMain.
         ($ReturnModules[2] -notmatch "^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\mscoree\.dll$") -and
         # WindowsApps executables sometimes just jump to a dll of the same name!
-        ($ReturnModules[2] -notcontains $StartAddressModule.Replace(".exe", ".dll")))
+        ($ReturnModules[2] -notcontains $StartAddressModule.Replace(".exe", ".dll")) -and
+        # WoW64 thread
+        $StackSummary -notmatch "^ntdll;wow64;wow64cpu;wow64")
     {
         $Detections += "hijacked($($StackSummary))"
     }
