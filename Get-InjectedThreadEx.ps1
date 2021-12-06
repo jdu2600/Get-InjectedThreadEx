@@ -276,18 +276,19 @@ function Get-InjectedThreadEx
 
             if ($MemoryState -eq $MemState::MEM_COMMIT)
             {
-                $StartBytesLength = [math]::Min(48, [UInt64]$MemoryBasicInfo.BaseAddress + [UInt64]$MemoryBasicInfo.RegionSize - [Int64]$Win32StartAddress)
+                $StartBytesLength = [math]::Min([Int64]48, $MemoryBasicInfo.BaseAddress.ToUInt64() + $MemoryBasicInfo.RegionSize.ToUInt64() - $Win32StartAddress.ToInt64())
                 $Buffer = ReadProcessMemory -ProcessHandle $hProcess -BaseAddress $Win32StartAddress -Size $StartBytesLength
-                $StartBytes = New-Object -TypeName System.Text.StringBuilder($StartBytesLength)
+                $StartBytes = New-Object -TypeName System.Text.StringBuilder
+                $StartBytes.Capacity = $StartBytesLength
                 ForEach ($Byte in $Buffer) { $StartBytes.AppendFormat("{0:x2}", $Byte) | Out-Null }
                 $StartBytes = $StartBytes.ToString()
 
-                $TailBytesLength = [math]::Min(16, [Int64]$Win32StartAddress - [UInt64]$MemoryBasicInfo.BaseAddress)
-                $Buffer = ReadProcessMemory -ProcessHandle $hProcess -BaseAddress ([Int64]$Win32StartAddress - $TailBytesLength) -Size $TailBytesLength
-                $TailBytes = New-Object -TypeName System.Text.StringBuilder($TailBytesLength)
+                $TailBytesLength = [math]::Min([Int64]16, $Win32StartAddress.ToInt64() - $MemoryBasicInfo.BaseAddress.ToUInt64())
+                $Buffer = ReadProcessMemory -ProcessHandle $hProcess -BaseAddress ($Win32StartAddress.ToInt64() - $TailBytesLength) -Size $TailBytesLength
+                $TailBytes = New-Object -TypeName System.Text.StringBuilder
+                $TailBytes.Capacity = $TailBytesLength
                 ForEach ($Byte in $Buffer) { $TailBytes.AppendFormat("{0:x2}", $Byte) | Out-Null }
                 $TailBytes = $TailBytes.ToString()
-
 
                 # All threads not starting in a MEM_IMAGE region are suspicious
                 if ($MemoryType -ne $MemType::MEM_IMAGE)
@@ -313,7 +314,7 @@ function Get-InjectedThreadEx
                 '(488(1|3)ec' +                      # sub rsp,n
                 '|b8........e8........482be0)' +     # mov rax; call; sub rsp, rax
                 '|4885c90f8[4-5]........(e9........cc|b8........c3)' + # test rcx,rcx; j[n]e nnnn; [jmp nnnn | mov eax, ret]
-                '|(488d0[5d]........)?(488b..(..)?)*(e9|(48)?ff25)' +  # (mov ... ) jmp
+                '|(488d0[5d]........)?(488b..(..)?)*(48)?(e9|ff25)' +  # (mov ... ) jmp
                 '|4d5a90000300000004000000ffff0000b8000000000000004000000000000000' + # PE Header -> CLR Assembly with AddressOfEntryPoint=0
                 ')'
                 # TODO(jdu) - update with more variants? Or is the approach simply too unreliable?
@@ -416,7 +417,8 @@ function Get-InjectedThreadEx
                 
                 $WrapperRegex = '^[A-Z]:\\Windows\\Sys(tem32|WOW64)\\((msvcr[t0-9]+|ucrtbase)d?|SHCore|Shlwapi)\.dll$'
                 if ((-not $IsWow64Process) -and                     # TODO(jdu) Wow64 support not implemented
-                    ($StartAddressModule -match $WrapperRegex) -or  # Always perform if a known wrapper module.    
+                    ($StartAddressModule -match $WrapperRegex) -or  # Always perform if a known wrapper module.
+                    ($StartAddressModule -match $NtdllRegex) -or    # Always perform if ntdll.
                     $Aggressive -or
                     ($Detections.Length -ne 0))
                 {
@@ -446,16 +448,16 @@ function Get-InjectedThreadEx
                 $EarlyCallRegex = '^(..)*?(e8|ff15)'
                 $ImmediateJumpRegex = '^(e9|(48)?ff25)'
                 if (($Aggressive -or ($Detections.Length -ne 0)) -and
-                    (([Int64]$Win32StartAddress -band 0xF) -ne 0) -and
+                    (($Win32StartAddress.ToInt64() -band 0xF) -ne 0) -and
                     # If < Windows 10 then also allow 4-byte alignments
-                    (($WindowsVersion -ge 10) -or (([Int64]$Win32StartAddress -band 3) -ne 0)))
+                    (($WindowsVersion -ge 10) -or (($Win32StartAddress.ToInt64() -band 3) -ne 0)))
                 {
                     if ($StartBytes -match $EarlyCallRegex)
                     {
                         # Calulate the distance to the end of the call modulo 16
                         # This calculation isn't perfect - we did a rough regex match, not an exact decompilation...
                         $BytesNeeded = (($matches[0].Length / 2) -band 0xF) + 4
-                        $BytesLoaded = 16 - ([Int64]$Win32StartAddress -band 0xF)
+                        $BytesLoaded = 16 - ($Win32StartAddress.ToInt64() -band 0xF)
                         if ($BytesLoaded -lt $BytesNeeded)
                         {
                             $Detections += 'alignment'
@@ -795,8 +797,8 @@ Author - John Uhlmann (@jdu2600)
     $Tib = $TibPtr -as $TIB64
 
     # 3. Read the (partial) stack contents
-    $StackReadLength = [math]::Min(0x2000, [Int64]$Tib.StackBase - [Int64]$Tib.StackLimit)
-    $StackBuffer = ReadProcessMemory -ProcessHandle $ProcessHandle -BaseAddress ([Int64]$Tib.StackBase - $StackReadLength) -Size $StackReadLength
+    $StackReadLength = [math]::Min([Int64]0x1000, $Tib.StackBase.ToInt64() - $Tib.StackLimit.ToInt64())
+    $StackBuffer = ReadProcessMemory -ProcessHandle $ProcessHandle -BaseAddress ($Tib.StackBase.ToInt64() - $StackReadLength) -Size $StackReadLength
 
     # 4. Search the stack bottom up for the (probable) initial return addresses of the first 5 frames.
     # [expected] ntdll!RtlUserThreadStart -> kernel32!BaseThreadInitThunk -> Win32StartAddress
