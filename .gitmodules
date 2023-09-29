@@ -1,0 +1,3 @@
+[submodule "Get-InjectedThreadEx/zydis"]
+	path = Get-InjectedThreadEx/zydis
+	url = https://github.com/zyantific/zydis
