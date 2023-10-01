@@ -116,10 +116,11 @@ BOOL ScanThread(HANDLE hProcess, BOOL bIsDotNet, PSS_THREAD_ENTRY& thread, std::
     };
 
     if (mappedPath.ends_with(L"\\System32\\ntdll.dll")) {
-        auto bInvalidNtdllEntry = true;
+        auto bValidNtdllEntry = false;
         for (const auto& address : ntdllThreadEntryPoints)
-            bInvalidNtdllEntry &= address == thread.Win32StartAddress;
-        if (bInvalidNtdllEntry) {
+            bValidNtdllEntry |= address == thread.Win32StartAddress;
+
+        if (!bValidNtdllEntry) {
             detections.push_back("unexpected(" + symbol + ")");
         }
     }
@@ -140,7 +141,7 @@ BOOL ScanThread(HANDLE hProcess, BOOL bIsDotNet, PSS_THREAD_ENTRY& thread, std::
     // Check the bytes immmediately after Win32StartAddress
     // They must be a function entrypoint.
     // ... but almost anything is a valid entrypoint!
-    // x64 prologs have more structure (albiet mostly by convention) - so we'll stick those.
+    // x64 prologs have more structure (albiet mostly by convention) - so we'll stick to those.
     // See https://learn.microsoft.com/en-us/cpp/build/prolog-and-epilog
     // 
     // Note - the loader ignores AddressOfEntry in CLR assemblies so we need to ignore them too.
