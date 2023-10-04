@@ -14,7 +14,6 @@
 //    original
 //     - not MEM_IMAGE
 //    new
-//     - not MEM_COMMIT
 //     - MEM_IMAGE and Win32StartAddress is on a private (modified) page
 //     - MEM_IMAGE and x64 dll and Win32StartAddress is CFG violation or suppressed export
 //     - MEM_IMAGE and Win32StartAddress is in a suspicious module
