@@ -98,6 +98,24 @@ function Get-InjectedThreadEx
         [UInt32]$ProcessId
     )
 
+    $bannerWidth = 74
+    $pad = { param($s) "  $s" + (' ' * [Math]::Max(0, $bannerWidth - 4 - $s.Length)) + "  " }
+    $blank = ' ' * $bannerWidth
+    $lines = @(
+        $blank
+        (& $pad "=== DEPRECATED ===")
+        (& $pad "")
+        (& $pad "Get-InjectedThreadEx.ps1 was deprecated in September 2023.")
+        (& $pad "It was replaced by Get-InjectedThreadEx.exe")
+        (& $pad "")
+        (& $pad "https://github.com/jdu2600/Get-InjectedThreadEx/releases")
+        $blank
+    )
+    foreach ($line in $lines) {
+        Write-Host $line -BackgroundColor DarkCyan -ForegroundColor Yellow
+    }
+    Write-Host ""
+
     if(![Environment]::Is64BitProcess)
     {
         Write-Warning "32-bit not currently supported."
